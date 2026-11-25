@@ -67,6 +67,10 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_match(/derived from %1 /, reports.first)
   end
 
+  def test_report_only_ruby_objects_not_c_pointers_in_value
+    assert_equal(["bad_typed_data_used_after_gc"], reported_functions("c_pointer_in_value.c"))
+  end
+
   private
 
   def reported_functions(fixture)

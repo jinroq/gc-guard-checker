@@ -6,6 +6,7 @@
 
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
@@ -58,6 +59,45 @@ collectDerivedAccesses(const SmallPtrSet<Value *, 16> &Derived) {
 
 // GC はメモリへの書き込みを伴うので、メモリを読むだけの呼び出し (strlen など、
 // LLVM が memory 属性を推論できるもの) は GC を起こさない
+// TBAA のアクセスタグ (基底型, アクセス型, オフセット) の基底型が構造体なら
+// その名前を返す
+std::optional<StringRef> tbaaBaseTypeName(const Instruction &I) {
+  MDNode *Tag = I.getMetadata(LLVMContext::MD_tbaa);
+  if (!Tag || Tag->getNumOperands() < 3)
+    return std::nullopt;
+  auto *Base = dyn_cast<MDNode>(Tag->getOperand(0));
+  // スカラー型のノードは {名前, 親} の2要素、構造体型は {名前, (型, オフセット)...}
+  if (!Base || Base->getNumOperands() < 3)
+    return std::nullopt;
+  if (auto *Name = dyn_cast<MDString>(Base->getOperand(0)))
+    return Name->getString();
+  return std::nullopt;
+}
+
+bool isRubyObjectStruct(StringRef Name) {
+  static const StringSet<> Names = {
+      "RBasic",   "RArray",  "RBignum", "RClass",    "RComplex", "RData",
+      "RFile",    "RFloat",  "RHash",   "RMatch",    "RObject",  "RRational",
+      "RRegexp",  "RString", "RStruct", "RSymbol",   "RTypedData"};
+  return Names.contains(Name);
+}
+
+// v が Ruby オブジェクトとして使われているか。VALUE 型に C の構造体への
+// ポインタを詰めることがあるので、TBAA の構造体名で区別する。Ruby 以外の
+// 構造体としてのアクセスしか無いときだけ「Ruby オブジェクトではない」とみなし、
+// 手がかりが無ければ保守的に Ruby オブジェクトとして扱う。
+bool isUsedAsRubyObject(const SmallVector<Instruction *, 8> &Accesses) {
+  bool SeenOtherStruct = false;
+  for (Instruction *I : Accesses) {
+    if (auto Name = tbaaBaseTypeName(*I)) {
+      if (isRubyObjectStruct(*Name))
+        return true;
+      SeenOtherStruct = true;
+    }
+  }
+  return !SeenOtherStruct;
+}
+
 bool mayTriggerGC(const CallBase &CB) {
   if (CB.isInlineAsm() || isa<IntrinsicInst>(CB))
     return false;
@@ -166,6 +206,8 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
       if (Reported.contains(V))
         continue;
       auto Accesses = collectDerivedAccesses(collectDerivedPointers(Base));
+      if (!isUsedAsRubyObject(Accesses))
+        continue;
       for (CallBase *C : GCCalls) {
         if (!isPotentiallyReachable(Base, C) || isLiveAt(V, C))
           continue;
