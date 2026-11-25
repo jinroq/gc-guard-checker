@@ -120,6 +120,10 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_equal(["bad_guard_assignment_overwritten"], reported_functions("guard_assignment.c"))
   end
 
+  def test_reachability_in_large_function
+    assert_equal([], reported_functions("large_function.c"))
+  end
+
   private
 
   def reported_functions(fixture)

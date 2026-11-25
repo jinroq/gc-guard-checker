@@ -4,12 +4,14 @@
 // 呼び出し C の後で使っているのに、C より後に v の使用が無い (= C の時点で v が
 // スタックやレジスタに残っている保証が無い) 箇所を報告する。
 
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
-#include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
@@ -22,6 +24,52 @@
 using namespace llvm;
 
 namespace {
+
+// 命令間の到達可能性。LLVM の isPotentiallyReachable は探索するブロック数に
+// 上限があり、超えると「到達しうる」と答えるので、大きな関数では誤検出と
+// 見逃しの原因になる。ここでは上限を設けず、ブロックごとの到達集合を
+// 必要になった分だけ計算してキャッシュする。
+class Reachability {
+public:
+  explicit Reachability(Function &F) {
+    unsigned N = 0;
+    for (BasicBlock &BB : F)
+      Index[&BB] = N++;
+  }
+
+  // From を実行した後に To を実行しうるか (From == To のときは、同じ命令に
+  // 戻ってこられるかではなく、真とする)
+  bool reaches(const Instruction *From, const Instruction *To) const {
+    if (From == To)
+      return true;
+    const BasicBlock *FB = From->getParent(), *TB = To->getParent();
+    if (FB == TB && From->comesBefore(To))
+      return true;
+    return successorsReach(FB).test(Index.lookup(TB));
+  }
+
+private:
+  // BB から 1 本以上の辺をたどって到達できるブロックの集合
+  const BitVector &successorsReach(const BasicBlock *BB) const {
+    auto It = Cache.find(BB);
+    if (It != Cache.end())
+      return It->second;
+    BitVector Seen(Index.size());
+    SmallVector<const BasicBlock *, 32> Worklist(succ_begin(BB), succ_end(BB));
+    while (!Worklist.empty()) {
+      const BasicBlock *B = Worklist.pop_back_val();
+      unsigned I = Index.lookup(B);
+      if (Seen.test(I))
+        continue;
+      Seen.set(I);
+      Worklist.append(succ_begin(B), succ_end(B));
+    }
+    return Cache[BB] = std::move(Seen);
+  }
+
+  DenseMap<const BasicBlock *, unsigned> Index;
+  mutable DenseMap<const BasicBlock *, BitVector> Cache;
+};
 
 // v を元にしたポインタ (派生ポインタ) を集める。報告を毎回同じにするため
 // 挿入順を保つ集合を使う
@@ -61,8 +109,6 @@ collectDerivedAccesses(const SmallSetVector<Value *, 16> &Derived) {
   return Accesses;
 }
 
-// GC はメモリへの書き込みを伴うので、メモリを読むだけの呼び出し (strlen など、
-// LLVM が memory 属性を推論できるもの) は GC を起こさない
 // TBAA のアクセスタグ (基底型, アクセス型, オフセット) の基底型が構造体なら
 // その名前を返す
 std::optional<StringRef> tbaaBaseTypeName(const Instruction &I) {
@@ -150,6 +196,8 @@ bool isLibraryCallWithoutCallback(const CallBase &CB, const Function &Callee,
   });
 }
 
+// C が GC を起こしうるか。GC はメモリへの書き込みを伴うので、メモリを
+// 読むだけの呼び出し (LLVM が memory 属性を推論できるもの) は GC を起こさない
 bool mayTriggerGC(const CallBase &CB, const TargetLibraryInfo &TLI) {
   if (CB.isInlineAsm() || isa<IntrinsicInst>(CB))
     return false;
@@ -302,14 +350,14 @@ SmallVector<StoreInst *, 8> storesTo(AllocaInst *Slot);
 // From から C までの間に、スロットが v 以外の値で上書きされうるか
 bool mayBeOverwrittenBetween(AllocaInst *Slot, Instruction *From,
                              const SmallPtrSet<Value *, 8> &Aliases,
-                             Instruction *C) {
+                             Instruction *C, const Reachability &R) {
   for (StoreInst *SI : storesTo(Slot)) {
     if (SI == From)
       continue;
     Value *W = SI->getValueOperand();
     if (Aliases.contains(W) || mergesWith(W, Aliases))
       continue;
-    if (isPotentiallyReachable(From, SI) && isPotentiallyReachable(SI, C))
+    if (R.reaches(From, SI) && R.reaches(SI, C))
       return true;
   }
   return false;
@@ -318,20 +366,20 @@ bool mayBeOverwrittenBetween(AllocaInst *Slot, Instruction *From,
 // v の定義から C までの間に、スロットが v 以外の値で上書きされうるか
 bool mayBeOverwrittenBefore(AllocaInst *Slot, Value *V,
                             const SmallPtrSet<Value *, 8> &Aliases,
-                            Instruction *C) {
+                            Instruction *C, const Reachability &R) {
   Instruction *Def = dyn_cast<Instruction>(V);
   if (!Def)
     Def = &*C->getFunction()->getEntryBlock().getFirstInsertionPt();
-  return mayBeOverwrittenBetween(Slot, Def, Aliases, C);
+  return mayBeOverwrittenBetween(Slot, Def, Aliases, C, R);
 }
 
 // From から C までの間に、スロットの lifetime が終わりうるか
 bool lifetimeMayEndBetween(AllocaInst *Slot, Instruction *From,
-                           Instruction *C) {
+                           Instruction *C, const Reachability &R) {
   for (User *U : Slot->users())
     if (auto *II = dyn_cast<IntrinsicInst>(U);
         II && II->getIntrinsicID() == Intrinsic::lifetime_end &&
-        isPotentiallyReachable(From, II) && isPotentiallyReachable(II, C))
+        R.reaches(From, II) && R.reaches(II, C))
       return true;
   return false;
 }
@@ -375,27 +423,27 @@ SmallVector<StoreInst *, 8> storesTo(AllocaInst *Slot) {
 // 上書きも lifetime の終了も無ければ、v は C の時点でスタック上にある
 // (file.c の CheckPath のような RB_GC_GUARD(v) = ... の形)。
 bool isResidentInSlotAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
-                        Instruction *C) {
+                        Instruction *C, const Reachability &R) {
   for (User *U : A->users()) {
     auto *SI = dyn_cast<StoreInst>(U);
     if (!SI || !SI->isVolatile() || SI->getValueOperand() != A)
       continue;
     AllocaInst *Slot = resolveSlot(SI->getPointerOperand());
-    if (Slot && isPotentiallyReachable(SI, C) &&
-        !mayBeOverwrittenBetween(Slot, SI, Aliases, C) &&
-        !lifetimeMayEndBetween(Slot, SI, C))
+    if (Slot && R.reaches(SI, C) &&
+        !mayBeOverwrittenBetween(Slot, SI, Aliases, C, R) &&
+        !lifetimeMayEndBetween(Slot, SI, C, R))
       return true;
   }
   return false;
 }
 
 // C から (C 自身も含めて) 到達しうる、X の実際の使用があるか
-bool hasUseReachableFrom(Value *X, Instruction *C) {
+bool hasUseReachableFrom(Value *X, Instruction *C, const Reachability &R) {
   for (User *U : X->users()) {
     auto *I = dyn_cast<Instruction>(U);
     if (!I || I->isLifetimeStartOrEnd())
       continue;
-    if (I == C || isPotentiallyReachable(C, I))
+    if (R.reaches(C, I))
       return true;
   }
   return false;
@@ -407,18 +455,18 @@ bool hasUseReachableFrom(Value *X, Instruction *C) {
 //   - v を保持するスロット (またはそれを指す値) の使用が C 以降にあり、
 //     それまでにスロットが上書きされない
 bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
-              const Instruction &Base) {
+              const Instruction &Base, const Reachability &R) {
   auto Aliases = collectValueAliases(V, &DT, &Base);
   for (Value *A : Aliases) {
-    if (hasUseReachableFrom(A, C))
+    if (hasUseReachableFrom(A, C, R))
       return true;
-    if (isResidentInSlotAt(A, Aliases, C))
+    if (isResidentInSlotAt(A, Aliases, C, R))
       return true;
     for (AllocaInst *Slot : collectSlots(A)) {
-      if (mayBeOverwrittenBefore(Slot, A, Aliases, C))
+      if (mayBeOverwrittenBefore(Slot, A, Aliases, C, R))
         continue;
       for (Value *H : collectHolders(Slot))
-        if (hasUseReachableFrom(H, C))
+        if (hasUseReachableFrom(H, C, R))
           return true;
     }
   }
@@ -508,6 +556,7 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
       return PreservedAnalyses::all();
     auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
     auto &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
+    Reachability R(F);
     SmallVector<CallBase *, 16> GCCalls;
     SmallVector<IntToPtrInst *, 16> Bases;
     for (Instruction &I : instructions(F)) {
@@ -526,10 +575,10 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
       if (!isUsedAsRubyObject(Accesses))
         continue;
       for (CallBase *C : GCCalls) {
-        if (!isPotentiallyReachable(Base, C) || isLiveAt(V, C, DT, *Base))
+        if (!R.reaches(Base, C) || isLiveAt(V, C, DT, *Base, R))
           continue;
         auto *Use = find_if(Accesses, [&](Instruction *U) {
-          return isPotentiallyReachable(C, U);
+          return R.reaches(C, U);
         });
         if (Use != Accesses.end()) {
           report(F, V, *C, **Use);
