@@ -166,8 +166,10 @@ bool hasUseReachableFrom(Value *X, Instruction *C) {
   return false;
 }
 
-// v とビット列が等しい値 (v 自身, inttoptr(v), そのキャストやオフセット 0 の
-// GEP) を集める。これらがレジスタやスタックにあれば保守的 GC は v をマークする。
+// v とビット列が等しくなりうる値 (v 自身, inttoptr(v), そのキャストや
+// オフセット 0 の GEP, v を合流させる phi/select) を集める。これらが
+// レジスタやスタックにあれば保守的 GC は v をマークする。phi/select は
+// v が渡ってくる経路では v そのものなので、生きていれば v も生きている。
 // 一方 RSTRING_PTR の embed 側のような内部ポインタではマークされない。
 SmallPtrSet<Value *, 8> collectValueAliases(Value *V) {
   SmallPtrSet<Value *, 8> Aliases;
@@ -177,8 +179,12 @@ SmallPtrSet<Value *, 8> collectValueAliases(Value *V) {
     if (!Aliases.insert(A).second)
       continue;
     for (User *U : A->users()) {
-      if (isa<IntToPtrInst, PtrToIntInst, BitCastInst, AddrSpaceCastInst>(U))
+      if (isa<IntToPtrInst, PtrToIntInst, BitCastInst, AddrSpaceCastInst,
+              PHINode>(U))
         Worklist.push_back(U);
+      else if (auto *SI = dyn_cast<SelectInst>(U);
+               SI && SI->getCondition() != A)
+        Worklist.push_back(SI);
       else if (auto *GEP = dyn_cast<GetElementPtrInst>(U);
                GEP && GEP->hasAllZeroIndices())
         Worklist.push_back(GEP);

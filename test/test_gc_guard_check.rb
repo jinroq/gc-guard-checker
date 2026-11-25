@@ -81,6 +81,10 @@ class TestGCGuardCheck < Test::Unit::TestCase
                  reported_functions("known_non_gc_functions.c"))
   end
 
+  def test_no_report_when_value_is_live_through_phi
+    assert_equal([], reported_functions("value_merged_by_phi.c"))
+  end
+
   private
 
   def reported_functions(fixture)
