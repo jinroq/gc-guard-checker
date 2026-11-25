@@ -124,6 +124,11 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_equal([], reported_functions("large_function.c"))
   end
 
+  def test_pointer_passed_to_call
+    assert_equal(["bad_ptr_passed_to_allocating_call", "bad_ptr_passed_to_memcpy_after_gc"],
+                 reported_functions("ptr_passed_to_call.c"))
+  end
+
   private
 
   def reported_functions(fixture)

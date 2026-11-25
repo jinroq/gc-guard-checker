@@ -94,7 +94,10 @@ SmallSetVector<Value *, 16> collectDerivedPointers(IntToPtrInst *Base) {
   return Derived;
 }
 
-// 派生ポインタを通したメモリアクセス
+// 派生ポインタを通したメモリアクセス。派生ポインタを引数として受け取る
+// 呼び出しも、呼び出し先で読み書きしうるのでアクセスとみなす。それが GC を
+// 起こしうる呼び出しなら、呼び出し先の中で GC が起きてからアクセスする
+// ことがある (rb_str_new はオブジェクトを確保してからコピーする)。
 SmallVector<Instruction *, 8>
 collectDerivedAccesses(const SmallSetVector<Value *, 16> &Derived) {
   SmallVector<Instruction *, 8> Accesses;
@@ -105,6 +108,9 @@ collectDerivedAccesses(const SmallSetVector<Value *, 16> &Derived) {
       else if (auto *SI = dyn_cast<StoreInst>(U);
                SI && SI->getPointerOperand() == P)
         Accesses.push_back(SI);
+      else if (auto *CB = dyn_cast<CallBase>(U);
+               CB && CB->hasArgument(P) && !CB->isLifetimeStartOrEnd())
+        Accesses.push_back(CB);
     }
   return Accesses;
 }
