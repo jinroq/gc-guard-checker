@@ -101,9 +101,10 @@ bool isUsedAsRubyObject(const SmallVector<Instruction *, 8> &Accesses) {
   return !SeenOtherStruct;
 }
 
-// 実装を確認して GC を起こさないと分かった関数 (完全一致で照合する)。
-// 追加するときは、オブジェクトの解放・移動や ruby_xmalloc 系の確保、
-// Ruby レベルのコードの呼び出しが無いことを確かめる。
+// 実装を確認して「正常に戻ったときには GC が起きていない」と分かった関数
+// (完全一致で照合する)。追加するときは、戻ってくる経路にオブジェクトの
+// 解放・移動や ruby_xmalloc 系の確保、Ruby レベルのコードの呼び出しが
+// 無いことを確かめる。raise して戻らない経路で GC するのは構わない。
 bool isKnownNonGCFunction(StringRef Name) {
   static const StringSet<> Names = {
       // マークと remembered set への記録だけで、確保は素の malloc
@@ -113,8 +114,26 @@ bool isKnownNonGCFunction(StringRef Name) {
       "rb_errno_ptr",
       // libc のシステムコールラッパー
       "fcntl",
+      // 以下は GC が起こりうるのが raise して戻らない経路だけなので、
+      // 正常に戻ったときは GC していない
+      // fptr が NULL なら raise するだけ
+      "rb_io_check_initialized",
+      // 上記に加え、fd < 0 なら割り込みを処理してから raise する
+      "rb_io_check_closed",
+      // rb_check_frozen は frozen なら raise する。chilled string の分岐は
+      // IO オブジェクトでは通らない
+      "rb_io_taint_check",
   };
   return Names.contains(Name);
+}
+
+// 第1引数をそのまま返すと実装を確認した関数
+bool returnsFirstArgument(const CallBase &CB) {
+  static const StringSet<> Names = {
+      "rb_io_taint_check",
+  };
+  const Function *Callee = CB.getCalledFunction();
+  return Callee && CB.arg_size() >= 1 && Names.contains(Callee->getName());
 }
 
 bool mayTriggerGC(const CallBase &CB) {
@@ -168,6 +187,8 @@ SmallPtrSet<Value *, 8> collectValueAliases(Value *V,
     Value *A = Worklist.pop_back_val();
     if (!Aliases.insert(A).second)
       continue;
+    if (auto *CB = dyn_cast<CallBase>(A); CB && returnsFirstArgument(*CB))
+      Worklist.push_back(CB->getArgOperand(0));
     for (User *U : A->users()) {
       if (isa<IntToPtrInst, PtrToIntInst, BitCastInst, AddrSpaceCastInst,
               PHINode>(U))
@@ -178,6 +199,9 @@ SmallPtrSet<Value *, 8> collectValueAliases(Value *V,
       else if (auto *GEP = dyn_cast<GetElementPtrInst>(U);
                GEP && GEP->hasAllZeroIndices())
         Worklist.push_back(GEP);
+      else if (auto *CB = dyn_cast<CallBase>(U);
+               CB && returnsFirstArgument(*CB) && CB->getArgOperand(0) == A)
+        Worklist.push_back(CB);
       else if (auto *Cmp = dyn_cast<ICmpInst>(U); Cmp && DT && Base)
         if (Value *W = equalOperandDominating(*Cmp, A, *DT, *Base))
           Worklist.push_back(W);
@@ -335,8 +359,9 @@ Origin originOf(Value *V, SmallPtrSetImpl<Value *> &Visited) {
     return Origin::Other;
   if (isa<Argument>(V))
     return Origin::Argument;
-  if (isa<CallBase>(V))
-    return Origin::Call;
+  if (auto *CB = dyn_cast<CallBase>(V))
+    return returnsFirstArgument(*CB) ? originOf(CB->getArgOperand(0), Visited)
+                                     : Origin::Call;
   SmallVector<Value *, 4> Sources;
   if (auto *PN = dyn_cast<PHINode>(V))
     Sources.append(PN->incoming_values().begin(), PN->incoming_values().end());

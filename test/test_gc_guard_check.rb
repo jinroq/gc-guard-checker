@@ -106,6 +106,12 @@ class TestGCGuardCheck < Test::Unit::TestCase
     }, origins)
   end
 
+  def test_io_helpers_that_gc_only_when_raising
+    reports = analyze("io_pointer.c").lines.grep(REPORT_RE)
+    assert_equal(["bad_origin_through_returned_argument"], reports.map { |l| l[REPORT_RE, 1] })
+    assert_match(/\[origin=argument\]$/, reports.first)
+  end
+
   private
 
   def reported_functions(fixture)
