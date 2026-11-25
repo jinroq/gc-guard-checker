@@ -9,6 +9,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/CFG.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -127,12 +128,40 @@ bool mayTriggerGC(const CallBase &CB) {
   return true;
 }
 
+// Cmp が A と W を icmp eq/ne で比べ、その分岐の「等しい側」の辺が Base を
+// 支配するなら W を返す
+Value *equalOperandDominating(ICmpInst &Cmp, Value *A, const DominatorTree &DT,
+                              const Instruction &Base) {
+  if (!Cmp.isEquality())
+    return nullptr;
+  Value *W = Cmp.getOperand(0) == A ? Cmp.getOperand(1) : Cmp.getOperand(0);
+  if (isa<Constant>(W))
+    return nullptr;
+  for (User *U : Cmp.users()) {
+    auto *Br = dyn_cast<BranchInst>(U);
+    if (!Br || !Br->isConditional())
+      continue;
+    BasicBlock *EqualSucc =
+        Br->getSuccessor(Cmp.getPredicate() == CmpInst::ICMP_EQ ? 0 : 1);
+    if (DT.dominates(BasicBlockEdge(Br->getParent(), EqualSucc),
+                     Base.getParent()))
+      return W;
+  }
+  return nullptr;
+}
+
 // v とビット列が等しくなりうる値 (v 自身, inttoptr(v), そのキャストや
 // オフセット 0 の GEP, v を合流させる phi/select) を集める。これらが
 // レジスタやスタックにあれば保守的 GC は v をマークする。phi/select は
 // v が渡ってくる経路では v そのものなので、生きていれば v も生きている。
 // 一方 RSTRING_PTR の embed 側のような内部ポインタではマークされない。
-SmallPtrSet<Value *, 8> collectValueAliases(Value *V) {
+//
+// DT と Base が与えられたときは、icmp eq/ne で v と比べた値 W も、等しい側の
+// 辺が Base を支配するなら別名とみなす。コンパイラはその範囲で v を W に
+// 置き換えることがある (GVN の等価性伝播)。
+SmallPtrSet<Value *, 8> collectValueAliases(Value *V,
+                                            const DominatorTree *DT = nullptr,
+                                            const Instruction *Base = nullptr) {
   SmallPtrSet<Value *, 8> Aliases;
   SmallVector<Value *, 8> Worklist{V};
   while (!Worklist.empty()) {
@@ -149,6 +178,9 @@ SmallPtrSet<Value *, 8> collectValueAliases(Value *V) {
       else if (auto *GEP = dyn_cast<GetElementPtrInst>(U);
                GEP && GEP->hasAllZeroIndices())
         Worklist.push_back(GEP);
+      else if (auto *Cmp = dyn_cast<ICmpInst>(U); Cmp && DT && Base)
+        if (Value *W = equalOperandDominating(*Cmp, A, *DT, *Base))
+          Worklist.push_back(W);
     }
   }
   return Aliases;
@@ -261,8 +293,9 @@ bool hasUseReachableFrom(Value *X, Instruction *C) {
 
 // C の時点で v が生きている (C 以降に v と等しい値またはその保持場所の
 // 使用がある) か
-bool isLiveAt(Value *V, Instruction *C) {
-  auto Aliases = collectValueAliases(V);
+bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
+              const Instruction &Base) {
+  auto Aliases = collectValueAliases(V, &DT, &Base);
   for (Value *A : Aliases) {
     if (hasUseReachableFrom(A, C))
       return true;
@@ -301,7 +334,10 @@ void report(Function &F, Value *V, CallBase &C, Instruction &Use) {
 }
 
 struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+    if (F.isDeclaration())
+      return PreservedAnalyses::all();
+    auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
     SmallVector<CallBase *, 16> GCCalls;
     SmallVector<IntToPtrInst *, 16> Bases;
     for (Instruction &I : instructions(F)) {
@@ -320,7 +356,7 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
       if (!isUsedAsRubyObject(Accesses))
         continue;
       for (CallBase *C : GCCalls) {
-        if (!isPotentiallyReachable(Base, C) || isLiveAt(V, C))
+        if (!isPotentiallyReachable(Base, C) || isLiveAt(V, C, DT, *Base))
           continue;
         auto *Use = find_if(Accesses, [&](Instruction *U) {
           return isPotentiallyReachable(C, U);

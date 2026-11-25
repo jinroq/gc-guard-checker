@@ -90,6 +90,10 @@ class TestGCGuardCheck < Test::Unit::TestCase
                  reported_functions("guard_on_address_taken_var.c"))
   end
 
+  def test_value_known_equal_to_guarded_value
+    assert_equal(["bad_guard_on_unequal_value"], reported_functions("guarded_equal_value.c"))
+  end
+
   private
 
   def reported_functions(fixture)
