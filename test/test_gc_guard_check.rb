@@ -112,6 +112,10 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_match(/\[origin=argument\]$/, reports.first)
   end
 
+  def test_libc_calls_do_not_trigger_gc_unless_given_callback
+    assert_equal(["bad_libc_call_with_callback"], reported_functions("libc_calls.c"))
+  end
+
   private
 
   def reported_functions(fixture)

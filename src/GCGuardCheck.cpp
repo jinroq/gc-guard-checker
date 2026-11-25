@@ -9,6 +9,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
@@ -136,14 +137,30 @@ bool returnsFirstArgument(const CallBase &CB) {
   return Callee && CB.arg_size() >= 1 && Names.contains(Callee->getName());
 }
 
-bool mayTriggerGC(const CallBase &CB) {
+// libc などの既知のライブラリ関数は Ruby のコードを呼び返さないので GC を
+// 起こさない。ただし qsort のように関数ポインタを渡す呼び出しは、
+// コールバックが GC を起こしうる。
+bool isLibraryCallWithoutCallback(const CallBase &CB, const Function &Callee,
+                                  const TargetLibraryInfo &TLI) {
+  LibFunc LF;
+  if (!TLI.getLibFunc(Callee, LF) || !TLI.has(LF))
+    return false;
+  return none_of(CB.args(), [](const Use &Arg) {
+    return isa<Function>(Arg->stripPointerCasts());
+  });
+}
+
+bool mayTriggerGC(const CallBase &CB, const TargetLibraryInfo &TLI) {
   if (CB.isInlineAsm() || isa<IntrinsicInst>(CB))
     return false;
   if (CB.onlyReadsMemory())
     return false;
-  if (const Function *Callee = CB.getCalledFunction();
-      Callee && isKnownNonGCFunction(Callee->getName()))
-    return false;
+  if (const Function *Callee = CB.getCalledFunction()) {
+    if (isKnownNonGCFunction(Callee->getName()))
+      return false;
+    if (isLibraryCallWithoutCallback(CB, *Callee, TLI))
+      return false;
+  }
   return true;
 }
 
@@ -416,10 +433,11 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
     if (F.isDeclaration())
       return PreservedAnalyses::all();
     auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+    auto &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
     SmallVector<CallBase *, 16> GCCalls;
     SmallVector<IntToPtrInst *, 16> Bases;
     for (Instruction &I : instructions(F)) {
-      if (auto *CB = dyn_cast<CallBase>(&I); CB && mayTriggerGC(*CB))
+      if (auto *CB = dyn_cast<CallBase>(&I); CB && mayTriggerGC(*CB, TLI))
         GCCalls.push_back(CB);
       else if (auto *ITP = dyn_cast<IntToPtrInst>(&I))
         Bases.push_back(ITP);
