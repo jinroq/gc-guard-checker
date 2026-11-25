@@ -33,8 +33,8 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_equal([], reported_functions("no_gc_call_between.c"))
   end
 
-  def test_report_when_guarded_before_gc_call
-    assert_equal(["bad_guard_before_gc"], reported_functions("guard_before_gc.c"))
+  def test_guard_before_gc_call_keeps_value_while_slot_is_alive
+    assert_equal(["bad_guarded_var_out_of_scope"], reported_functions("guard_before_gc.c"))
   end
 
   def test_no_report_when_value_is_used_after_pointer

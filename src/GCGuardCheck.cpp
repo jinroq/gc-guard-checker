@@ -424,18 +424,38 @@ SmallVector<StoreInst *, 8> storesTo(AllocaInst *Slot) {
   return Stores;
 }
 
-// v が volatile な store でスロットに書かれ、C の時点までスロットに
-// 残っているか。volatile な store は省略も移動もされないので、その後
-// 上書きも lifetime の終了も無ければ、v は C の時点でスタック上にある
-// (file.c の CheckPath のような RB_GC_GUARD(v) = ... の形)。
+// スロットの番地が関数の外に逃げる (asm や呼び出しに渡る、メモリに格納
+// される) か。RB_GC_GUARD(v) はスロットの番地を asm に渡す。
+bool isEscaped(AllocaInst *Slot) {
+  for (Value *H : collectHolders(Slot))
+    for (User *U : H->users()) {
+      if (auto *CB = dyn_cast<CallBase>(U);
+          CB && CB->hasArgument(H) && !CB->isLifetimeStartOrEnd())
+        return true;
+      if (auto *SI = dyn_cast<StoreInst>(U);
+          SI && SI->getValueOperand() == H &&
+          !isa<AllocaInst>(SI->getPointerOperand()))
+        return true;
+    }
+  return false;
+}
+
+// v がスロットに書かれ、C の時点までスロットに残っているか。
+// 番地が逃げたスロットについては、コンパイラは「後の呼び出しがスロットを
+// 読むかもしれない」と考えるので、store を省略したり遅らせたりできない
+// (volatile な store も同じ)。その後で上書きも lifetime の終了も無ければ、
+// v は C の時点でスタック上にある。RB_GC_GUARD(v) をどこに置いても、
+// v が書き換えられずスロットが生きている間は v が守られるのはこのため。
 bool isResidentInSlotAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
                         Instruction *C, const Reachability &R) {
   for (User *U : A->users()) {
     auto *SI = dyn_cast<StoreInst>(U);
-    if (!SI || !SI->isVolatile() || SI->getValueOperand() != A)
+    if (!SI || SI->getValueOperand() != A)
       continue;
     AllocaInst *Slot = resolveSlot(SI->getPointerOperand());
-    if (Slot && R.reaches(SI, C) &&
+    if (!Slot || !(SI->isVolatile() || isEscaped(Slot)))
+      continue;
+    if (R.reaches(SI, C) &&
         !mayBeOverwrittenBetween(Slot, SI, Aliases, C, R) &&
         !lifetimeMayEndBetween(Slot, SI, C, R))
       return true;
@@ -457,7 +477,8 @@ bool hasUseReachableFrom(Value *X, Instruction *C, const Reachability &R) {
 
 // C の時点で v が生きているか。次のいずれかなら生きているとみなす。
 //   - C 以降に v と等しい値の使用がある
-//   - v が volatile な store でスロットに書かれ、C の時点まで残っている
+//   - v が (volatile な store か、番地が逃げたスロットへの store で)
+//     スロットに書かれ、C の時点まで残っている
 //   - v を保持するスロット (またはそれを指す値) の使用が C 以降にあり、
 //     それまでにスロットが上書きされない
 bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
