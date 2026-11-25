@@ -85,10 +85,15 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_equal([], reported_functions("value_merged_by_phi.c"))
   end
 
+  def test_guard_on_address_taken_variable
+    assert_equal(["bad_slot_overwritten_before_gc"],
+                 reported_functions("guard_on_address_taken_var.c"))
+  end
+
   private
 
   def reported_functions(fixture)
-    analyze(fixture).lines.filter_map { |l| l[REPORT_RE, 1] }.sort
+    analyze(fixture).lines.filter_map { |l| l[REPORT_RE, 1] }.uniq.sort
   end
 
   def analyze(fixture)

@@ -127,45 +127,6 @@ bool mayTriggerGC(const CallBase &CB) {
   return true;
 }
 
-// v を保持するスタック上の場所を集める。RB_GC_GUARD(v) は v を alloca に置き、
-// その番地 (を格納した alloca) を asm と volatile load から参照する形になる。
-SmallPtrSet<Value *, 8> collectStackHolders(Value *V) {
-  SmallPtrSet<Value *, 8> Holders;
-  SmallVector<Value *, 8> Worklist;
-  for (User *U : V->users())
-    if (auto *SI = dyn_cast<StoreInst>(U);
-        SI && SI->getValueOperand() == V &&
-        isa<AllocaInst>(SI->getPointerOperand()))
-      Worklist.push_back(SI->getPointerOperand());
-  while (!Worklist.empty()) {
-    Value *H = Worklist.pop_back_val();
-    if (!Holders.insert(H).second)
-      continue;
-    for (User *U : H->users()) {
-      if (auto *SI = dyn_cast<StoreInst>(U);
-          SI && SI->getValueOperand() == H &&
-          isa<AllocaInst>(SI->getPointerOperand()))
-        Worklist.push_back(SI->getPointerOperand());
-      else if (auto *LI = dyn_cast<LoadInst>(U);
-               LI && LI->getType()->isPointerTy())
-        Worklist.push_back(LI);
-    }
-  }
-  return Holders;
-}
-
-// C から (C 自身も含めて) 到達しうる、X の実際の使用があるか
-bool hasUseReachableFrom(Value *X, Instruction *C) {
-  for (User *U : X->users()) {
-    auto *I = dyn_cast<Instruction>(U);
-    if (!I || I->isLifetimeStartOrEnd())
-      continue;
-    if (I == C || isPotentiallyReachable(C, I))
-      return true;
-  }
-  return false;
-}
-
 // v とビット列が等しくなりうる値 (v 自身, inttoptr(v), そのキャストや
 // オフセット 0 の GEP, v を合流させる phi/select) を集める。これらが
 // レジスタやスタックにあれば保守的 GC は v をマークする。phi/select は
@@ -193,15 +154,125 @@ SmallPtrSet<Value *, 8> collectValueAliases(Value *V) {
   return Aliases;
 }
 
+bool isAllocaSlot(Value *P) { return isa<AllocaInst>(P); }
+
+// v を保持しうるスタック上のスロット (alloca) の候補を集める。
+// RB_GC_GUARD(v) で番地を取られた変数は alloca に置かれるので、v は
+// そこへ store されるか、そこから load される。phi の場合は、すべての
+// incoming 値に共通するスロットだけが v を保持している。
+SmallPtrSet<Value *, 4> collectSlots(Value *V, unsigned Depth = 0) {
+  SmallPtrSet<Value *, 4> Slots;
+  if (auto *LI = dyn_cast<LoadInst>(V);
+      LI && !LI->isVolatile() && isAllocaSlot(LI->getPointerOperand()))
+    Slots.insert(LI->getPointerOperand());
+  for (User *U : V->users())
+    if (auto *SI = dyn_cast<StoreInst>(U);
+        SI && SI->getValueOperand() == V &&
+        isAllocaSlot(SI->getPointerOperand()))
+      Slots.insert(SI->getPointerOperand());
+  if (auto *PN = dyn_cast<PHINode>(V); PN && Depth < 4) {
+    std::optional<SmallPtrSet<Value *, 4>> Common;
+    for (Value *In : PN->incoming_values()) {
+      if (In == PN)
+        continue;
+      auto InSlots = collectSlots(In, Depth + 1);
+      if (!Common) {
+        Common = InSlots;
+        continue;
+      }
+      SmallVector<Value *, 4> Gone;
+      for (Value *S : *Common)
+        if (!InSlots.contains(S))
+          Gone.push_back(S);
+      for (Value *S : Gone)
+        Common->erase(S);
+    }
+    if (Common)
+      Slots.insert(Common->begin(), Common->end());
+  }
+  return Slots;
+}
+
+// W が v と同じ phi/select に合流するか。合流するなら、W をスロットに
+// store する経路では、使われるポインタも W から作られている
+// (x = rb_str_new(...) のような変数の差し替え)。
+bool mergesWith(Value *W, const SmallPtrSet<Value *, 8> &Aliases) {
+  if (isa<Constant>(W))
+    return false;
+  for (Value *A : collectValueAliases(W))
+    if (isa<PHINode, SelectInst>(A) && Aliases.contains(A))
+      return true;
+  return false;
+}
+
+// v の定義から C までの間に、スロットが v 以外の値で上書きされうるか
+bool mayBeOverwrittenBefore(Value *Slot, Value *V,
+                            const SmallPtrSet<Value *, 8> &Aliases,
+                            Instruction *C) {
+  Instruction *Def = dyn_cast<Instruction>(V);
+  if (!Def)
+    Def = &*C->getFunction()->getEntryBlock().getFirstInsertionPt();
+  for (User *U : Slot->users()) {
+    auto *SI = dyn_cast<StoreInst>(U);
+    if (!SI || SI->getPointerOperand() != Slot)
+      continue;
+    Value *W = SI->getValueOperand();
+    if (Aliases.contains(W) || mergesWith(W, Aliases))
+      continue;
+    if (isPotentiallyReachable(Def, SI) && isPotentiallyReachable(SI, C))
+      return true;
+  }
+  return false;
+}
+
+// スロットとそれを指す値を集める。RB_GC_GUARD(v) はスロットの番地を
+// 別の alloca に格納し、それを asm と volatile load から参照する形になる。
+SmallPtrSet<Value *, 8> collectHolders(Value *Slot) {
+  SmallPtrSet<Value *, 8> Holders;
+  SmallVector<Value *, 8> Worklist{Slot};
+  while (!Worklist.empty()) {
+    Value *H = Worklist.pop_back_val();
+    if (!Holders.insert(H).second)
+      continue;
+    for (User *U : H->users()) {
+      if (auto *SI = dyn_cast<StoreInst>(U);
+          SI && SI->getValueOperand() == H &&
+          isAllocaSlot(SI->getPointerOperand()))
+        Worklist.push_back(SI->getPointerOperand());
+      else if (auto *LI = dyn_cast<LoadInst>(U);
+               LI && LI->getType()->isPointerTy())
+        Worklist.push_back(LI);
+    }
+  }
+  return Holders;
+}
+
+// C から (C 自身も含めて) 到達しうる、X の実際の使用があるか
+bool hasUseReachableFrom(Value *X, Instruction *C) {
+  for (User *U : X->users()) {
+    auto *I = dyn_cast<Instruction>(U);
+    if (!I || I->isLifetimeStartOrEnd())
+      continue;
+    if (I == C || isPotentiallyReachable(C, I))
+      return true;
+  }
+  return false;
+}
+
 // C の時点で v が生きている (C 以降に v と等しい値またはその保持場所の
 // 使用がある) か
 bool isLiveAt(Value *V, Instruction *C) {
-  for (Value *A : collectValueAliases(V)) {
+  auto Aliases = collectValueAliases(V);
+  for (Value *A : Aliases) {
     if (hasUseReachableFrom(A, C))
       return true;
-    for (Value *H : collectStackHolders(A))
-      if (hasUseReachableFrom(H, C))
-        return true;
+    for (Value *Slot : collectSlots(A)) {
+      if (mayBeOverwrittenBefore(Slot, A, Aliases, C))
+        continue;
+      for (Value *H : collectHolders(Slot))
+        if (hasUseReachableFrom(H, C))
+          return true;
+    }
   }
   return false;
 }
