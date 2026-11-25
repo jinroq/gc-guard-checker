@@ -116,6 +116,10 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_equal(["bad_libc_call_with_callback"], reported_functions("libc_calls.c"))
   end
 
+  def test_guard_assignment_keeps_value_on_stack
+    assert_equal(["bad_guard_assignment_overwritten"], reported_functions("guard_assignment.c"))
+  end
+
   private
 
   def reported_functions(fixture)

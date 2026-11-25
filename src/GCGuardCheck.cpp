@@ -227,24 +227,21 @@ SmallPtrSet<Value *, 8> collectValueAliases(Value *V,
   return Aliases;
 }
 
-bool isAllocaSlot(Value *P) { return isa<AllocaInst>(P); }
-
 // v を保持しうるスタック上のスロット (alloca) の候補を集める。
 // RB_GC_GUARD(v) で番地を取られた変数は alloca に置かれるので、v は
 // そこへ store されるか、そこから load される。phi の場合は、すべての
 // incoming 値に共通するスロットだけが v を保持している。
-SmallPtrSet<Value *, 4> collectSlots(Value *V, unsigned Depth = 0) {
-  SmallPtrSet<Value *, 4> Slots;
-  if (auto *LI = dyn_cast<LoadInst>(V);
-      LI && !LI->isVolatile() && isAllocaSlot(LI->getPointerOperand()))
-    Slots.insert(LI->getPointerOperand());
+SmallPtrSet<AllocaInst *, 4> collectSlots(Value *V, unsigned Depth = 0) {
+  SmallPtrSet<AllocaInst *, 4> Slots;
+  if (auto *LI = dyn_cast<LoadInst>(V); LI && !LI->isVolatile())
+    if (auto *AI = dyn_cast<AllocaInst>(LI->getPointerOperand()))
+      Slots.insert(AI);
   for (User *U : V->users())
-    if (auto *SI = dyn_cast<StoreInst>(U);
-        SI && SI->getValueOperand() == V &&
-        isAllocaSlot(SI->getPointerOperand()))
-      Slots.insert(SI->getPointerOperand());
+    if (auto *SI = dyn_cast<StoreInst>(U); SI && SI->getValueOperand() == V)
+      if (auto *AI = dyn_cast<AllocaInst>(SI->getPointerOperand()))
+        Slots.insert(AI);
   if (auto *PN = dyn_cast<PHINode>(V); PN && Depth < 4) {
-    std::optional<SmallPtrSet<Value *, 4>> Common;
+    std::optional<SmallPtrSet<AllocaInst *, 4>> Common;
     for (Value *In : PN->incoming_values()) {
       if (In == PN)
         continue;
@@ -253,11 +250,11 @@ SmallPtrSet<Value *, 4> collectSlots(Value *V, unsigned Depth = 0) {
         Common = InSlots;
         continue;
       }
-      SmallVector<Value *, 4> Gone;
-      for (Value *S : *Common)
+      SmallVector<AllocaInst *, 4> Gone;
+      for (AllocaInst *S : *Common)
         if (!InSlots.contains(S))
           Gone.push_back(S);
-      for (Value *S : Gone)
+      for (AllocaInst *S : Gone)
         Common->erase(S);
     }
     if (Common)
@@ -278,23 +275,64 @@ bool mergesWith(Value *W, const SmallPtrSet<Value *, 8> &Aliases) {
   return false;
 }
 
+// ポインタが指すスロットを返す。RB_GC_GUARD(v) = ... は、スロットの番地を
+// 格納した別の alloca から読み出したポインタを通して store する形になる。
+AllocaInst *resolveSlot(Value *Ptr, unsigned Depth = 0) {
+  if (auto *AI = dyn_cast<AllocaInst>(Ptr))
+    return AI;
+  auto *LI = dyn_cast<LoadInst>(Ptr);
+  if (!LI || Depth >= 4 || !isa<AllocaInst>(LI->getPointerOperand()))
+    return nullptr;
+  AllocaInst *Found = nullptr;
+  for (User *U : LI->getPointerOperand()->users()) {
+    auto *SI = dyn_cast<StoreInst>(U);
+    if (!SI || SI->getPointerOperand() != LI->getPointerOperand())
+      continue;
+    AllocaInst *Slot = resolveSlot(SI->getValueOperand(), Depth + 1);
+    if (!Slot || (Found && Found != Slot))
+      return nullptr;
+    Found = Slot;
+  }
+  return Found;
+}
+
+// スロットへの store (スロットを指すポインタを通したものも含む)
+SmallVector<StoreInst *, 8> storesTo(AllocaInst *Slot);
+
+// From から C までの間に、スロットが v 以外の値で上書きされうるか
+bool mayBeOverwrittenBetween(AllocaInst *Slot, Instruction *From,
+                             const SmallPtrSet<Value *, 8> &Aliases,
+                             Instruction *C) {
+  for (StoreInst *SI : storesTo(Slot)) {
+    if (SI == From)
+      continue;
+    Value *W = SI->getValueOperand();
+    if (Aliases.contains(W) || mergesWith(W, Aliases))
+      continue;
+    if (isPotentiallyReachable(From, SI) && isPotentiallyReachable(SI, C))
+      return true;
+  }
+  return false;
+}
+
 // v の定義から C までの間に、スロットが v 以外の値で上書きされうるか
-bool mayBeOverwrittenBefore(Value *Slot, Value *V,
+bool mayBeOverwrittenBefore(AllocaInst *Slot, Value *V,
                             const SmallPtrSet<Value *, 8> &Aliases,
                             Instruction *C) {
   Instruction *Def = dyn_cast<Instruction>(V);
   if (!Def)
     Def = &*C->getFunction()->getEntryBlock().getFirstInsertionPt();
-  for (User *U : Slot->users()) {
-    auto *SI = dyn_cast<StoreInst>(U);
-    if (!SI || SI->getPointerOperand() != Slot)
-      continue;
-    Value *W = SI->getValueOperand();
-    if (Aliases.contains(W) || mergesWith(W, Aliases))
-      continue;
-    if (isPotentiallyReachable(Def, SI) && isPotentiallyReachable(SI, C))
+  return mayBeOverwrittenBetween(Slot, Def, Aliases, C);
+}
+
+// From から C までの間に、スロットの lifetime が終わりうるか
+bool lifetimeMayEndBetween(AllocaInst *Slot, Instruction *From,
+                           Instruction *C) {
+  for (User *U : Slot->users())
+    if (auto *II = dyn_cast<IntrinsicInst>(U);
+        II && II->getIntrinsicID() == Intrinsic::lifetime_end &&
+        isPotentiallyReachable(From, II) && isPotentiallyReachable(II, C))
       return true;
-  }
   return false;
 }
 
@@ -310,7 +348,7 @@ SmallPtrSet<Value *, 8> collectHolders(Value *Slot) {
     for (User *U : H->users()) {
       if (auto *SI = dyn_cast<StoreInst>(U);
           SI && SI->getValueOperand() == H &&
-          isAllocaSlot(SI->getPointerOperand()))
+          isa<AllocaInst>(SI->getPointerOperand()))
         Worklist.push_back(SI->getPointerOperand());
       else if (auto *LI = dyn_cast<LoadInst>(U);
                LI && LI->getType()->isPointerTy())
@@ -318,6 +356,37 @@ SmallPtrSet<Value *, 8> collectHolders(Value *Slot) {
     }
   }
   return Holders;
+}
+
+SmallVector<StoreInst *, 8> storesTo(AllocaInst *Slot) {
+  SmallVector<StoreInst *, 8> Stores;
+  for (Value *H : collectHolders(Slot)) {
+    if (resolveSlot(H) != Slot)
+      continue;
+    for (User *U : H->users())
+      if (auto *SI = dyn_cast<StoreInst>(U); SI && SI->getPointerOperand() == H)
+        Stores.push_back(SI);
+  }
+  return Stores;
+}
+
+// v が volatile な store でスロットに書かれ、C の時点までスロットに
+// 残っているか。volatile な store は省略も移動もされないので、その後
+// 上書きも lifetime の終了も無ければ、v は C の時点でスタック上にある
+// (file.c の CheckPath のような RB_GC_GUARD(v) = ... の形)。
+bool isResidentInSlotAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
+                        Instruction *C) {
+  for (User *U : A->users()) {
+    auto *SI = dyn_cast<StoreInst>(U);
+    if (!SI || !SI->isVolatile() || SI->getValueOperand() != A)
+      continue;
+    AllocaInst *Slot = resolveSlot(SI->getPointerOperand());
+    if (Slot && isPotentiallyReachable(SI, C) &&
+        !mayBeOverwrittenBetween(Slot, SI, Aliases, C) &&
+        !lifetimeMayEndBetween(Slot, SI, C))
+      return true;
+  }
+  return false;
 }
 
 // C から (C 自身も含めて) 到達しうる、X の実際の使用があるか
@@ -332,15 +401,20 @@ bool hasUseReachableFrom(Value *X, Instruction *C) {
   return false;
 }
 
-// C の時点で v が生きている (C 以降に v と等しい値またはその保持場所の
-// 使用がある) か
+// C の時点で v が生きているか。次のいずれかなら生きているとみなす。
+//   - C 以降に v と等しい値の使用がある
+//   - v が volatile な store でスロットに書かれ、C の時点まで残っている
+//   - v を保持するスロット (またはそれを指す値) の使用が C 以降にあり、
+//     それまでにスロットが上書きされない
 bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
               const Instruction &Base) {
   auto Aliases = collectValueAliases(V, &DT, &Base);
   for (Value *A : Aliases) {
     if (hasUseReachableFrom(A, C))
       return true;
-    for (Value *Slot : collectSlots(A)) {
+    if (isResidentInSlotAt(A, Aliases, C))
+      return true;
+    for (AllocaInst *Slot : collectSlots(A)) {
       if (mayBeOverwrittenBefore(Slot, A, Aliases, C))
         continue;
       for (Value *H : collectHolders(Slot))
