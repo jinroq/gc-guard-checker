@@ -100,10 +100,31 @@ bool isUsedAsRubyObject(const SmallVector<Instruction *, 8> &Accesses) {
   return !SeenOtherStruct;
 }
 
+// 実装を確認して GC を起こさないと分かった関数 (完全一致で照合する)。
+// 追加するときは、オブジェクトの解放・移動や ruby_xmalloc 系の確保、
+// Ruby レベルのコードの呼び出しが無いことを確かめる。
+bool isKnownNonGCFunction(StringRef Name) {
+  static const StringSet<> Names = {
+      // マークと remembered set への記録だけで、確保は素の malloc
+      // (デフォルト GC の場合)
+      "rb_gc_writebarrier",
+      // &errno を返すだけ
+      "rb_errno_ptr",
+      // libc のシステムコールラッパー
+      "fcntl",
+  };
+  return Names.contains(Name);
+}
+
 bool mayTriggerGC(const CallBase &CB) {
   if (CB.isInlineAsm() || isa<IntrinsicInst>(CB))
     return false;
-  return !CB.onlyReadsMemory();
+  if (CB.onlyReadsMemory())
+    return false;
+  if (const Function *Callee = CB.getCalledFunction();
+      Callee && isKnownNonGCFunction(Callee->getName()))
+    return false;
+  return true;
 }
 
 // v を保持するスタック上の場所を集める。RB_GC_GUARD(v) は v を alloca に置き、

@@ -76,6 +76,11 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_match(/ used at \S*ptr_used_after_gc\.c:9 after call to rb_ary_new at \S*ptr_used_after_gc\.c:8 /, report)
   end
 
+  def test_no_report_for_known_non_gc_functions
+    assert_equal(["bad_similar_name_to_non_gc_function"],
+                 reported_functions("known_non_gc_functions.c"))
+  end
+
   private
 
   def reported_functions(fixture)
