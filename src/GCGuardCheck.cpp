@@ -463,6 +463,37 @@ bool isResidentInSlotAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
   return false;
 }
 
+// v が、番地の逃げたスロットから load された値で、C の時点までスロットに
+// 残っているか。load した時点ではスロットは v を保持しており、その後
+// 上書きも lifetime の終了も無ければ C の時点でも保持している
+// (FilePathValue(v) の後に v = ... と代入し直した値など)。
+bool isLoadedFromResidentSlot(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
+                              Instruction *C, const Reachability &R) {
+  auto *LI = dyn_cast<LoadInst>(A);
+  if (!LI)
+    return false;
+  auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand());
+  return Slot && isEscaped(Slot) && R.reaches(LI, C) &&
+         !mayBeOverwrittenBetween(Slot, LI, Aliases, C, R) &&
+         !lifetimeMayEndBetween(Slot, LI, C, R);
+}
+
+// v が C の時点でスタック上のスロットに残っているか。phi は、すべての
+// incoming 値が残っていれば残っている (どの経路から来ても、その経路の値が
+// スロットにある)。
+bool isResidentAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
+                  Instruction *C, const Reachability &R, unsigned Depth = 0) {
+  if (isResidentInSlotAt(A, Aliases, C, R) ||
+      isLoadedFromResidentSlot(A, Aliases, C, R))
+    return true;
+  auto *PN = dyn_cast<PHINode>(A);
+  if (!PN || Depth >= 4)
+    return false;
+  return all_of(PN->incoming_values(), [&](Value *In) {
+    return In == PN || isResidentAt(In, Aliases, C, R, Depth + 1);
+  });
+}
+
 // C から (C 自身も含めて) 到達しうる、X の実際の使用があるか
 bool hasUseReachableFrom(Value *X, Instruction *C, const Reachability &R) {
   for (User *U : X->users()) {
@@ -479,6 +510,7 @@ bool hasUseReachableFrom(Value *X, Instruction *C, const Reachability &R) {
 //   - C 以降に v と等しい値の使用がある
 //   - v が (volatile な store か、番地が逃げたスロットへの store で)
 //     スロットに書かれ、C の時点まで残っている
+//   - v が番地の逃げたスロットから load され、C の時点まで残っている
 //   - v を保持するスロット (またはそれを指す値) の使用が C 以降にあり、
 //     それまでにスロットが上書きされない
 bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
@@ -487,7 +519,7 @@ bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
   for (Value *A : Aliases) {
     if (hasUseReachableFrom(A, C, R))
       return true;
-    if (isResidentInSlotAt(A, Aliases, C, R))
+    if (isResidentAt(A, Aliases, C, R))
       return true;
     for (AllocaInst *Slot : collectSlots(A)) {
       if (mayBeOverwrittenBefore(Slot, A, Aliases, C, R))

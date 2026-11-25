@@ -129,6 +129,11 @@ class TestGCGuardCheck < Test::Unit::TestCase
                  reported_functions("ptr_passed_to_call.c"))
   end
 
+  def test_value_loaded_from_escaped_slot
+    assert_equal(["bad_loaded_then_slot_overwritten"],
+                 reported_functions("loaded_from_escaped_slot.c"))
+  end
+
   private
 
   def reported_functions(fixture)
