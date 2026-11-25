@@ -71,6 +71,11 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_equal(["bad_typed_data_used_after_gc"], reported_functions("c_pointer_in_value.c"))
   end
 
+  def test_report_includes_source_locations
+    report = analyze("ptr_used_after_gc.c").lines.grep(REPORT_RE).first
+    assert_match(/ used at \S*ptr_used_after_gc\.c:9 after call to rb_ary_new at \S*ptr_used_after_gc\.c:8 /, report)
+  end
+
   private
 
   def reported_functions(fixture)
@@ -80,7 +85,7 @@ class TestGCGuardCheck < Test::Unit::TestCase
   def analyze(fixture)
     Dir.mktmpdir do |dir|
       ll = File.join(dir, "out.ll")
-      run!(File.join(LLVM_BIN, "clang"), "-O2", "-S", "-emit-llvm", "-Wno-macro-redefined",
+      run!(File.join(LLVM_BIN, "clang"), "-O2", "-g", "-S", "-emit-llvm", "-Wno-macro-redefined",
            "-I#{RUBY_SRC}/include", "-I#{arch_include}",
            File.join(FIXTURES, fixture), "-o", ll)
       run!(File.join(LLVM_BIN, "opt"), "-load-pass-plugin=#{PLUGIN}",

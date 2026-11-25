@@ -4,6 +4,7 @@
 // 呼び出し C の後で使っているのに、C より後に v の使用が無い (= C の時点で v が
 // スタックやレジスタに残っている保証が無い) 箇所を報告する。
 
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
@@ -20,13 +21,14 @@ using namespace llvm;
 
 namespace {
 
-// v を元にしたポインタ (派生ポインタ) を集める
-SmallPtrSet<Value *, 16> collectDerivedPointers(IntToPtrInst *Base) {
-  SmallPtrSet<Value *, 16> Derived;
+// v を元にしたポインタ (派生ポインタ) を集める。報告を毎回同じにするため
+// 挿入順を保つ集合を使う
+SmallSetVector<Value *, 16> collectDerivedPointers(IntToPtrInst *Base) {
+  SmallSetVector<Value *, 16> Derived;
   SmallVector<Value *, 16> Worklist{Base};
   while (!Worklist.empty()) {
     Value *P = Worklist.pop_back_val();
-    if (!Derived.insert(P).second)
+    if (!Derived.insert(P))
       continue;
     for (User *U : P->users()) {
       if (isa<GetElementPtrInst, PHINode, SelectInst, BitCastInst,
@@ -44,7 +46,7 @@ SmallPtrSet<Value *, 16> collectDerivedPointers(IntToPtrInst *Base) {
 
 // 派生ポインタを通したメモリアクセス
 SmallVector<Instruction *, 8>
-collectDerivedAccesses(const SmallPtrSet<Value *, 16> &Derived) {
+collectDerivedAccesses(const SmallSetVector<Value *, 16> &Derived) {
   SmallVector<Instruction *, 8> Accesses;
   for (Value *P : Derived)
     for (User *U : P->users()) {
@@ -177,15 +179,26 @@ bool isLiveAt(Value *V, Instruction *C) {
   return false;
 }
 
-void report(Function &F, Value *V, CallBase &C) {
+void printLocation(raw_ostream &OS, const Instruction &I) {
+  if (const DebugLoc &DL = I.getDebugLoc())
+    OS << DL->getFilename() << ":" << DL.getLine();
+  else
+    OS << "<unknown>";
+}
+
+void report(Function &F, Value *V, CallBase &C, Instruction &Use) {
   raw_ostream &OS = outs();
   OS << "gc-guard-check: " << F.getName() << ": pointer derived from ";
   V->printAsOperand(OS, false);
-  OS << " is used after ";
+  OS << " is used at ";
+  printLocation(OS, Use);
+  OS << " after ";
   if (Function *Callee = C.getCalledFunction())
     OS << "call to " << Callee->getName();
   else
     OS << "indirect call";
+  OS << " at ";
+  printLocation(OS, C);
   OS << " without keeping it alive\n";
 }
 
@@ -211,11 +224,11 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
       for (CallBase *C : GCCalls) {
         if (!isPotentiallyReachable(Base, C) || isLiveAt(V, C))
           continue;
-        bool UsedAfter = any_of(Accesses, [&](Instruction *U) {
+        auto *Use = find_if(Accesses, [&](Instruction *U) {
           return isPotentiallyReachable(C, U);
         });
-        if (UsedAfter) {
-          report(F, V, *C);
+        if (Use != Accesses.end()) {
+          report(F, V, *C, **Use);
           Reported.insert(V);
           break;
         }
