@@ -1,10 +1,10 @@
 #include "ruby/ruby.h"
 
-/* RB_GC_GUARD(str) は GC 呼び出しより前にあるが、guard で str のスロットの
- * 番地が asm に渡る (escape する) ので、コンパイラはその後の呼び出しの前に
- * スロットを最新に保たなければならない。引数のスロットは関数の終わりまで
- * 再利用されないので、rb_ary_new() の時点でも str はスタック上にある。
- * 報告しない (境界: guard の位置) */
+/* RB_GC_GUARD(str) comes before the GC call, but the guard passes the
+ * address of the slot of str to an asm (it escapes), so the compiler must
+ * keep the slot up to date before later calls. The slot of an argument is
+ * not reused until the function returns, so str is still on the stack at
+ * rb_ary_new(). Not reported (boundary: position of the guard). */
 VALUE ok_guard_before_gc(VALUE str)
 {
     const char *p = RSTRING_PTR(str);
@@ -13,8 +13,9 @@ VALUE ok_guard_before_gc(VALUE str)
     return INT2FIX(p[0]);
 }
 
-/* ブロックの中の変数を guard しても、ブロックを抜けると lifetime が終わり、
- * スロットは再利用されうる。その後の GC 呼び出しでは守られないので報告する */
+/* Even if a variable in a block is guarded, its lifetime ends when leaving
+ * the block and the slot may be reused. It is not protected at a later GC
+ * call, so it is reported. */
 VALUE bad_guarded_var_out_of_scope(VALUE obj)
 {
     const char *p;

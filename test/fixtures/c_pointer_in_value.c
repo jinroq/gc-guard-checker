@@ -1,7 +1,7 @@
 #include "ruby/ruby.h"
 
-/* rb_rescue などのコールバックでは、VALUE 型の引数に C の構造体への
- * ポインタを詰めて渡すことがある。Ruby オブジェクトではないので報告しない */
+/* Callbacks for rb_rescue and friends may receive a pointer to a C struct
+ * disguised as a VALUE. It is not a Ruby object, so it is not reported. */
 struct callback_arg {
     const char *ptr;
     long len;
@@ -15,8 +15,8 @@ VALUE ok_c_pointer_in_value(VALUE arg)
     return INT2FIX(p[0]);
 }
 
-/* RTYPEDDATA_GET_DATA で得た C の構造体は Ruby オブジェクトが所有するので、
- * そのオブジェクトが死んでいれば報告する */
+/* A C struct obtained with RTYPEDDATA_GET_DATA is owned by the Ruby object,
+ * so it is reported when the object is dead. */
 static const rb_data_type_t data_type = { "callback_arg", { 0, 0, 0, }, 0, 0, 0 };
 
 VALUE bad_typed_data_used_after_gc(VALUE obj)

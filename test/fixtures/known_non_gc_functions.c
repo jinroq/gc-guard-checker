@@ -1,7 +1,8 @@
 #include "ruby/ruby.h"
 #include <fcntl.h>
 
-/* rb_gc_writebarrier / rb_errno_ptr / fcntl は GC を起こさないので報告しない */
+/* rb_gc_writebarrier, rb_errno_ptr and fcntl do not trigger GC, so it is not
+ * reported. */
 VALUE ok_known_non_gc_functions(VALUE str, VALUE a, VALUE b, int fd)
 {
     const char *p = RSTRING_PTR(str);
@@ -11,8 +12,8 @@ VALUE ok_known_non_gc_functions(VALUE str, VALUE a, VALUE b, int fd)
     return INT2FIX(p[0]);
 }
 
-/* 一覧は完全一致で照合する。名前が似ているだけの関数は GC を起こしうる
- * とみなして報告する (境界) */
+/* The list is matched exactly. A function with a merely similar name is
+ * assumed to possibly trigger GC, so it is reported (boundary). */
 void rb_gc_writebarrier_x(VALUE a, VALUE b);
 
 VALUE bad_similar_name_to_non_gc_function(VALUE str, VALUE a, VALUE b)

@@ -1,8 +1,9 @@
 #include "ruby/ruby.h"
 
-/* file.c の CheckPath と同じ形: RB_GC_GUARD(str) = ... は str のスロットへの
- * volatile な store になる。str は引数なのでスロットは関数全体で確保された
- * ままであり、後で読まれなくても GC 呼び出しの時点でスタック上に残っている */
+/* Same shape as CheckPath in file.c: RB_GC_GUARD(str) = ... is a volatile
+ * store to the slot of str. str is an argument, so its slot lives for the
+ * whole function, and str stays on the stack at the GC call even if it is
+ * not read later. */
 static inline VALUE
 to_string(VALUE obj, const char **cstr)
 {
@@ -20,8 +21,8 @@ VALUE ok_guard_assignment(VALUE str)
     return INT2FIX(p[0]);
 }
 
-/* volatile に store した後、GC 呼び出しより前にスロットを上書きしている
- * ので報告する (境界) */
+/* The slot is overwritten after the volatile store and before the GC call,
+ * so it is reported (boundary). */
 VALUE bad_guard_assignment_overwritten(VALUE str)
 {
     const char *p;

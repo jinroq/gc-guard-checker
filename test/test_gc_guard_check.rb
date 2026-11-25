@@ -4,8 +4,8 @@ require "test/unit"
 require "open3"
 require "tmpdir"
 
-# fixture の C ファイルを clang -O2 で LLVM IR にし、gc-guard-check pass を通して
-# 報告された関数名を検証する。
+# Compiles the C files in fixtures to LLVM IR with clang -O2, runs the
+# gc-guard-check pass on them and checks the reported functions.
 class TestGCGuardCheck < Test::Unit::TestCase
   ROOT = File.expand_path("..", __dir__)
   FIXTURES = File.join(__dir__, "fixtures")
@@ -14,7 +14,7 @@ class TestGCGuardCheck < Test::Unit::TestCase
   RUBY_BUILD = ENV.fetch("RUBY_BUILD", File.join(RUBY_SRC, "build"))
   PLUGIN = ENV.fetch("GC_GUARD_CHECK_PLUGIN", File.join(ROOT, "build", "GCGuardCheck.so"))
 
-  # 報告行の形式: "gc-guard-check: <関数名>: ..."
+  # Format of a report: "gc-guard-check: <function>: ..."
   REPORT_RE = /\Agc-guard-check: (\S+):/
 
   def test_no_report_without_derived_pointer

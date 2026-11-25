@@ -6,8 +6,8 @@ maybe_replace(VALUE *xp)
     if (RSTRING_LEN(*xp) == 0) *xp = rb_str_new_cstr("z");
 }
 
-/* x は &x を取られているのでスタック上に置かれ、v はそこから load される。
- * guard がそのスロットを後で参照するので報告しない */
+/* &x is taken, so x lives on the stack and v is loaded from there. The guard
+ * refers to the slot later, so it is not reported. */
 VALUE ok_guard_on_reloaded_var(VALUE x)
 {
     maybe_replace(&x);
@@ -18,8 +18,9 @@ VALUE ok_guard_on_reloaded_var(VALUE x)
     return INT2FIX(c);
 }
 
-/* swap 後の x は経路によって別のスロットから来た値の phi になるが、
- * どの経路でも x のスロットが保持している。報告しない (rb_big_and の形) */
+/* After the swap, x is a phi of values from different slots depending on the
+ * path, but the slot of x holds it on every path. Not reported (the shape in
+ * rb_big_and). */
 VALUE ok_guard_after_swap(VALUE x, VALUE y, VALUE flag)
 {
     maybe_replace(&x);
@@ -35,8 +36,8 @@ VALUE ok_guard_after_swap(VALUE x, VALUE y, VALUE flag)
     return INT2FIX(c);
 }
 
-/* スロットから load した後で、そのスロットを別の値で上書きしている。
- * GC 呼び出しの時点ではスロットは v を保持していないので報告する */
+/* The slot is overwritten with another value after v is loaded from it. The
+ * slot does not hold v at the GC call, so it is reported. */
 VALUE bad_slot_overwritten_before_gc(VALUE x)
 {
     maybe_replace(&x);

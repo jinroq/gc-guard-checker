@@ -1,8 +1,8 @@
 #include "ruby/ruby.h"
 #include "ruby/io.h"
 
-/* GetOpenFile は rb_io_taint_check と rb_io_check_closed を呼ぶ。どちらも
- * GC が起こりうるのは raise して戻らない経路だけなので報告しない */
+/* GetOpenFile calls rb_io_taint_check and rb_io_check_closed. Both may GC
+ * only on paths that raise and never return, so it is not reported. */
 VALUE ok_get_open_file(VALUE io)
 {
     rb_io_t *fptr;
@@ -10,8 +10,8 @@ VALUE ok_get_open_file(VALUE io)
     return INT2FIX(fptr->fd);
 }
 
-/* rb_io_taint_check は第1引数をそのまま返すので、戻り値の origin は
- * 引数になる */
+/* rb_io_taint_check returns its first argument, so the origin of the result
+ * is the argument. */
 VALUE bad_origin_through_returned_argument(VALUE io)
 {
     VALUE x = rb_io_taint_check(io);

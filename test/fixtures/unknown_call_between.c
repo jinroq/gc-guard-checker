@@ -2,7 +2,8 @@
 
 void some_unknown_function(void);
 
-/* 中身の分からない外部関数は GC を起こしうるとみなして報告する */
+/* An external function whose body is unknown is assumed to possibly trigger
+ * GC, so it is reported. */
 VALUE bad_unknown_call_between(VALUE str)
 {
     const char *p = RSTRING_PTR(str);

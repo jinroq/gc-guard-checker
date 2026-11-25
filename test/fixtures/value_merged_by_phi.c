@@ -1,8 +1,9 @@
 #include "ruby/ruby.h"
 
-/* s は分岐ごとに別の値として作られ、phi で合流してから使われる。
- * 合流後の値が生きていれば元の値も生きているので報告しない
- * (rb_ary_reject で rb_ary_new がインライン展開されたときに起きる形) */
+/* s is created as a different value on each branch and used after they are
+ * merged by a phi. If the merged value is live, so is the original one, so
+ * it is not reported (the shape when rb_ary_new is inlined into
+ * rb_ary_reject). */
 VALUE ok_value_merged_by_phi(VALUE flag)
 {
     VALUE s;

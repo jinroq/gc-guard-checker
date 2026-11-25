@@ -1,6 +1,7 @@
 #include "ruby/ruby.h"
 
-/* p の最後の使用が rb_ary_new() より前なので報告しない (境界) */
+/* The last use of p is before rb_ary_new(), so it is not reported
+ * (boundary). */
 VALUE ok_ptr_last_use_before_gc(VALUE str)
 {
     const char *p = RSTRING_PTR(str);

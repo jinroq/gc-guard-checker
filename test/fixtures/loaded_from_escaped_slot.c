@@ -1,10 +1,10 @@
 #include "ruby/ruby.h"
 
-/* s は FilePathValue と同じ RB_GC_GUARD(s) = ... でスロットの番地が逃げて
- * いる。その後の s = ... (普通の store) の値も、スロットが上書きされず
- * 生きている間はスタック上に残る。v はスロットから load した値になるが、
- * GC 呼び出しの時点でもスロットにあるので報告しない
- * (file.c の rb_check_realpath_emulate の basedir の形) */
+/* The address of the slot of s escapes with RB_GC_GUARD(s) = ..., as
+ * FilePathValue does. A value assigned later with s = ... (a plain store)
+ * also stays on the stack while the slot lives and is not overwritten. v is
+ * loaded from the slot and is still there at the GC call, so it is not
+ * reported (the shape of basedir in rb_check_realpath_emulate in file.c). */
 VALUE ok_loaded_from_escaped_slot(VALUE s, VALUE flag)
 {
     RB_GC_GUARD(s) = rb_obj_as_string(s);
@@ -14,8 +14,8 @@ VALUE ok_loaded_from_escaped_slot(VALUE s, VALUE flag)
     return INT2FIX(p[0]);
 }
 
-/* スロットから load した後、GC 呼び出しの前にスロットを上書きしているので
- * 報告する (境界) */
+/* The slot is overwritten after v is loaded from it and before the GC call,
+ * so it is reported (boundary). */
 VALUE bad_loaded_then_slot_overwritten(VALUE s, VALUE flag)
 {
     RB_GC_GUARD(s) = rb_obj_as_string(s);

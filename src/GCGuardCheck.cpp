@@ -1,8 +1,8 @@
-// gc-guard-check: RB_GC_GUARD の漏れを検出する LLVM pass
+// gc-guard-check: an LLVM pass that detects missing RB_GC_GUARD
 //
-// VALUE v から派生したポインタ p (RSTRING_PTR(v) など) を、GC を起こしうる
-// 呼び出し C の後で使っているのに、C より後に v の使用が無い (= C の時点で v が
-// スタックやレジスタに残っている保証が無い) 箇所を報告する。
+// Reports a pointer p derived from a VALUE v (RSTRING_PTR(v), ...) that is
+// used after a call C that may trigger GC, while v is not live at C (so
+// nothing guarantees that v is still on the stack or in a register there).
 
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
@@ -25,10 +25,11 @@ using namespace llvm;
 
 namespace {
 
-// 命令間の到達可能性。LLVM の isPotentiallyReachable は探索するブロック数に
-// 上限があり、超えると「到達しうる」と答えるので、大きな関数では誤検出と
-// 見逃しの原因になる。ここでは上限を設けず、ブロックごとの到達集合を
-// 必要になった分だけ計算してキャッシュする。
+// Reachability between instructions. LLVM's isPotentiallyReachable gives up
+// after exploring a limited number of blocks and answers "reachable", which
+// causes both false positives and false negatives in large functions. Here
+// reachability is unbounded: the set of blocks reachable from each queried
+// block is computed on demand and cached.
 class Reachability {
 public:
   explicit Reachability(Function &F) {
@@ -37,8 +38,8 @@ public:
       Index[&BB] = N++;
   }
 
-  // From を実行した後に To を実行しうるか (From == To のときは、同じ命令に
-  // 戻ってこられるかではなく、真とする)
+  // Whether To may be executed after From (true when From == To, rather than
+  // asking whether the instruction can be reached again).
   bool reaches(const Instruction *From, const Instruction *To) const {
     if (From == To)
       return true;
@@ -49,7 +50,7 @@ public:
   }
 
 private:
-  // BB から 1 本以上の辺をたどって到達できるブロックの集合
+  // The blocks reachable from BB through one or more edges
   const BitVector &successorsReach(const BasicBlock *BB) const {
     auto It = Cache.find(BB);
     if (It != Cache.end())
@@ -71,8 +72,8 @@ private:
   mutable DenseMap<const BasicBlock *, BitVector> Cache;
 };
 
-// v を元にしたポインタ (派生ポインタ) を集める。報告を毎回同じにするため
-// 挿入順を保つ集合を使う
+// Collects the pointers derived from v. Uses an insertion-ordered set so that
+// reports are deterministic.
 SmallSetVector<Value *, 16> collectDerivedPointers(IntToPtrInst *Base) {
   SmallSetVector<Value *, 16> Derived;
   SmallVector<Value *, 16> Worklist{Base};
@@ -85,7 +86,7 @@ SmallSetVector<Value *, 16> collectDerivedPointers(IntToPtrInst *Base) {
               AddrSpaceCastInst>(U)) {
         Worklist.push_back(U);
       } else if (auto *LI = dyn_cast<LoadInst>(U)) {
-        // オブジェクトが所有するバッファへのポインタ (heap.ptr など)
+        // A pointer to a buffer owned by the object (heap.ptr, ...)
         if (LI->getType()->isPointerTy())
           Worklist.push_back(LI);
       }
@@ -94,10 +95,10 @@ SmallSetVector<Value *, 16> collectDerivedPointers(IntToPtrInst *Base) {
   return Derived;
 }
 
-// 派生ポインタを通したメモリアクセス。派生ポインタを引数として受け取る
-// 呼び出しも、呼び出し先で読み書きしうるのでアクセスとみなす。それが GC を
-// 起こしうる呼び出しなら、呼び出し先の中で GC が起きてからアクセスする
-// ことがある (rb_str_new はオブジェクトを確保してからコピーする)。
+// Accesses through the derived pointers. A call receiving a derived pointer as
+// an argument also counts, as the callee may read or write through it. If the
+// call may trigger GC, the callee may access the pointer after GC (rb_str_new
+// allocates the object before copying).
 SmallVector<Instruction *, 8>
 collectDerivedAccesses(const SmallSetVector<Value *, 16> &Derived) {
   SmallVector<Instruction *, 8> Accesses;
@@ -115,14 +116,15 @@ collectDerivedAccesses(const SmallSetVector<Value *, 16> &Derived) {
   return Accesses;
 }
 
-// TBAA のアクセスタグ (基底型, アクセス型, オフセット) の基底型が構造体なら
-// その名前を返す
+// Returns the name of the base type of the TBAA access tag (base type, access
+// type, offset) if it is a struct
 std::optional<StringRef> tbaaBaseTypeName(const Instruction &I) {
   MDNode *Tag = I.getMetadata(LLVMContext::MD_tbaa);
   if (!Tag || Tag->getNumOperands() < 3)
     return std::nullopt;
   auto *Base = dyn_cast<MDNode>(Tag->getOperand(0));
-  // スカラー型のノードは {名前, 親} の2要素、構造体型は {名前, (型, オフセット)...}
+  // A scalar type node is {name, parent}; a struct type node is {name, (type,
+  // offset)...}
   if (!Base || Base->getNumOperands() < 3)
     return std::nullopt;
   if (auto *Name = dyn_cast<MDString>(Base->getOperand(0)))
@@ -138,10 +140,10 @@ bool isRubyObjectStruct(StringRef Name) {
   return Names.contains(Name);
 }
 
-// v が Ruby オブジェクトとして使われているか。VALUE 型に C の構造体への
-// ポインタを詰めることがあるので、TBAA の構造体名で区別する。Ruby 以外の
-// 構造体としてのアクセスしか無いときだけ「Ruby オブジェクトではない」とみなし、
-// 手がかりが無ければ保守的に Ruby オブジェクトとして扱う。
+// Whether v is used as a Ruby object. A C struct pointer is sometimes passed as
+// a VALUE, so TBAA struct names tell them apart. v is considered not a Ruby
+// object only when it is accessed only as non-Ruby structs; without a clue it
+// is conservatively treated as a Ruby object.
 bool isUsedAsRubyObject(const SmallVector<Instruction *, 8> &Accesses) {
   bool SeenOtherStruct = false;
   for (Instruction *I : Accesses) {
@@ -154,33 +156,34 @@ bool isUsedAsRubyObject(const SmallVector<Instruction *, 8> &Accesses) {
   return !SeenOtherStruct;
 }
 
-// 実装を確認して「正常に戻ったときには GC が起きていない」と分かった関数
-// (完全一致で照合する)。追加するときは、戻ってくる経路にオブジェクトの
-// 解放・移動や ruby_xmalloc 系の確保、Ruby レベルのコードの呼び出しが
-// 無いことを確かめる。raise して戻らない経路で GC するのは構わない。
+// Functions whose implementations were checked not to have triggered GC when
+// they return normally (matched exactly). Before adding one, check that the
+// paths that return do not free or move objects, allocate through ruby_xmalloc
+// and friends, or call Ruby-level code. GC on paths that raise and never return
+// is fine.
 bool isKnownNonGCFunction(StringRef Name) {
   static const StringSet<> Names = {
-      // マークと remembered set への記録だけで、確保は素の malloc
-      // (デフォルト GC の場合)
+      // Only marks and records in the remembered set, allocating with plain
+      // malloc (with the default GC)
       "rb_gc_writebarrier",
-      // &errno を返すだけ
+      // Only returns &errno
       "rb_errno_ptr",
-      // libc のシステムコールラッパー
+      // libc system call wrapper
       "fcntl",
-      // 以下は GC が起こりうるのが raise して戻らない経路だけなので、
-      // 正常に戻ったときは GC していない
-      // fptr が NULL なら raise するだけ
+      // The following may GC only on paths that raise and never return, so
+      // they have not triggered GC when they return normally.
+      // Only raises if fptr is NULL
       "rb_io_check_initialized",
-      // 上記に加え、fd < 0 なら割り込みを処理してから raise する
+      // In addition, processes interrupts and raises if fd < 0
       "rb_io_check_closed",
-      // rb_check_frozen は frozen なら raise する。chilled string の分岐は
-      // IO オブジェクトでは通らない
+      // rb_check_frozen raises if frozen. The branch for chilled strings is
+      // not taken for IO objects
       "rb_io_taint_check",
   };
   return Names.contains(Name);
 }
 
-// 第1引数をそのまま返すと実装を確認した関数
+// Functions checked to return their first argument as is
 bool returnsFirstArgument(const CallBase &CB) {
   static const StringSet<> Names = {
       "rb_io_taint_check",
@@ -189,9 +192,9 @@ bool returnsFirstArgument(const CallBase &CB) {
   return Callee && CB.arg_size() >= 1 && Names.contains(Callee->getName());
 }
 
-// libc などの既知のライブラリ関数は Ruby のコードを呼び返さないので GC を
-// 起こさない。ただし qsort のように関数ポインタを渡す呼び出しは、
-// コールバックが GC を起こしうる。
+// Library functions known to LLVM, such as libc's, never call back into Ruby,
+// so they do not trigger GC. A call passing a function pointer, like qsort, may
+// trigger GC through the callback, though.
 bool isLibraryCallWithoutCallback(const CallBase &CB, const Function &Callee,
                                   const TargetLibraryInfo &TLI) {
   LibFunc LF;
@@ -202,8 +205,8 @@ bool isLibraryCallWithoutCallback(const CallBase &CB, const Function &Callee,
   });
 }
 
-// C が GC を起こしうるか。GC はメモリへの書き込みを伴うので、メモリを
-// 読むだけの呼び出し (LLVM が memory 属性を推論できるもの) は GC を起こさない
+// Whether C may trigger GC. GC writes memory, so a call that only reads memory
+// (as LLVM's memory attributes tell) does not trigger GC.
 bool mayTriggerGC(const CallBase &CB, const TargetLibraryInfo &TLI) {
   if (CB.isInlineAsm() || isa<IntrinsicInst>(CB))
     return false;
@@ -218,8 +221,8 @@ bool mayTriggerGC(const CallBase &CB, const TargetLibraryInfo &TLI) {
   return true;
 }
 
-// Cmp が A と W を icmp eq/ne で比べ、その分岐の「等しい側」の辺が Base を
-// 支配するなら W を返す
+// If Cmp compares A and W with icmp eq/ne and the "equal" edge of its branch
+// dominates Base, returns W
 Value *equalOperandDominating(ICmpInst &Cmp, Value *A, const DominatorTree &DT,
                               const Instruction &Base) {
   if (!Cmp.isEquality())
@@ -240,15 +243,16 @@ Value *equalOperandDominating(ICmpInst &Cmp, Value *A, const DominatorTree &DT,
   return nullptr;
 }
 
-// v とビット列が等しくなりうる値 (v 自身, inttoptr(v), そのキャストや
-// オフセット 0 の GEP, v を合流させる phi/select) を集める。これらが
-// レジスタやスタックにあれば保守的 GC は v をマークする。phi/select は
-// v が渡ってくる経路では v そのものなので、生きていれば v も生きている。
-// 一方 RSTRING_PTR の embed 側のような内部ポインタではマークされない。
+// Collects the values that may have the same bits as v (v itself,
+// inttoptr(v), its casts, GEPs with zero offset, and phis/selects merging v).
+// If any of them is in a register or on the stack, the conservative GC marks
+// v. A phi/select is v itself on the paths where v flows in, so if it is
+// live, so is v. An interior pointer, such as RSTRING_PTR of an embedded
+// string, does not get v marked.
 //
-// DT と Base が与えられたときは、icmp eq/ne で v と比べた値 W も、等しい側の
-// 辺が Base を支配するなら別名とみなす。コンパイラはその範囲で v を W に
-// 置き換えることがある (GVN の等価性伝播)。
+// When DT and Base are given, a value W compared with v by icmp eq/ne is also
+// an alias if the "equal" edge dominates Base, since the compiler may replace
+// v with W there (equality propagation by GVN).
 SmallPtrSet<Value *, 8> collectValueAliases(Value *V,
                                             const DominatorTree *DT = nullptr,
                                             const Instruction *Base = nullptr) {
@@ -281,10 +285,10 @@ SmallPtrSet<Value *, 8> collectValueAliases(Value *V,
   return Aliases;
 }
 
-// v を保持しうるスタック上のスロット (alloca) の候補を集める。
-// RB_GC_GUARD(v) で番地を取られた変数は alloca に置かれるので、v は
-// そこへ store されるか、そこから load される。phi の場合は、すべての
-// incoming 値に共通するスロットだけが v を保持している。
+// Collects the candidate stack slots (allocas) that may hold v. A variable
+// whose address is taken by RB_GC_GUARD(v) lives in an alloca, so v is stored
+// to it or loaded from it. For a phi, only the slots common to all incoming
+// values hold it.
 SmallPtrSet<AllocaInst *, 4> collectSlots(Value *V, unsigned Depth = 0) {
   SmallPtrSet<AllocaInst *, 4> Slots;
   if (auto *LI = dyn_cast<LoadInst>(V); LI && !LI->isVolatile())
@@ -317,9 +321,9 @@ SmallPtrSet<AllocaInst *, 4> collectSlots(Value *V, unsigned Depth = 0) {
   return Slots;
 }
 
-// W が v と同じ phi/select に合流するか。合流するなら、W をスロットに
-// store する経路では、使われるポインタも W から作られている
-// (x = rb_str_new(...) のような変数の差し替え)。
+// Whether W is merged with v by a phi/select. If so, on the paths storing W to
+// the slot the pointer in use is also made from W (the variable was reassigned,
+// as in x = rb_str_new(...)).
 bool mergesWith(Value *W, const SmallPtrSet<Value *, 8> &Aliases) {
   if (isa<Constant>(W))
     return false;
@@ -329,8 +333,9 @@ bool mergesWith(Value *W, const SmallPtrSet<Value *, 8> &Aliases) {
   return false;
 }
 
-// ポインタが指すスロットを返す。RB_GC_GUARD(v) = ... は、スロットの番地を
-// 格納した別の alloca から読み出したポインタを通して store する形になる。
+// Returns the slot that the pointer points to. RB_GC_GUARD(v) = ... stores
+// through a pointer loaded from another alloca that holds the address of the
+// slot.
 AllocaInst *resolveSlot(Value *Ptr, unsigned Depth = 0) {
   if (auto *AI = dyn_cast<AllocaInst>(Ptr))
     return AI;
@@ -350,10 +355,11 @@ AllocaInst *resolveSlot(Value *Ptr, unsigned Depth = 0) {
   return Found;
 }
 
-// スロットへの store (スロットを指すポインタを通したものも含む)
+// The stores to the slot, including ones through pointers to it
 SmallVector<StoreInst *, 8> storesTo(AllocaInst *Slot);
 
-// From から C までの間に、スロットが v 以外の値で上書きされうるか
+// Whether the slot may be overwritten with a value other than v between From
+// and C
 bool mayBeOverwrittenBetween(AllocaInst *Slot, Instruction *From,
                              const SmallPtrSet<Value *, 8> &Aliases,
                              Instruction *C, const Reachability &R) {
@@ -369,7 +375,8 @@ bool mayBeOverwrittenBetween(AllocaInst *Slot, Instruction *From,
   return false;
 }
 
-// v の定義から C までの間に、スロットが v 以外の値で上書きされうるか
+// Whether the slot may be overwritten with a value other than v between the
+// definition of v and C
 bool mayBeOverwrittenBefore(AllocaInst *Slot, Value *V,
                             const SmallPtrSet<Value *, 8> &Aliases,
                             Instruction *C, const Reachability &R) {
@@ -379,7 +386,7 @@ bool mayBeOverwrittenBefore(AllocaInst *Slot, Value *V,
   return mayBeOverwrittenBetween(Slot, Def, Aliases, C, R);
 }
 
-// From から C までの間に、スロットの lifetime が終わりうるか
+// Whether the lifetime of the slot may end between From and C
 bool lifetimeMayEndBetween(AllocaInst *Slot, Instruction *From,
                            Instruction *C, const Reachability &R) {
   for (User *U : Slot->users())
@@ -390,8 +397,9 @@ bool lifetimeMayEndBetween(AllocaInst *Slot, Instruction *From,
   return false;
 }
 
-// スロットとそれを指す値を集める。RB_GC_GUARD(v) はスロットの番地を
-// 別の alloca に格納し、それを asm と volatile load から参照する形になる。
+// Collects the slot and the values pointing to it. RB_GC_GUARD(v) stores the
+// address of the slot to another alloca and refers to it from an asm and a
+// volatile load.
 SmallPtrSet<Value *, 8> collectHolders(Value *Slot) {
   SmallPtrSet<Value *, 8> Holders;
   SmallVector<Value *, 8> Worklist{Slot};
@@ -424,8 +432,8 @@ SmallVector<StoreInst *, 8> storesTo(AllocaInst *Slot) {
   return Stores;
 }
 
-// スロットの番地が関数の外に逃げる (asm や呼び出しに渡る、メモリに格納
-// される) か。RB_GC_GUARD(v) はスロットの番地を asm に渡す。
+// Whether the address of the slot escapes (is passed to an asm or a call, or
+// stored to memory). RB_GC_GUARD(v) passes it to an asm.
 bool isEscaped(AllocaInst *Slot) {
   for (Value *H : collectHolders(Slot))
     for (User *U : H->users()) {
@@ -440,12 +448,12 @@ bool isEscaped(AllocaInst *Slot) {
   return false;
 }
 
-// v がスロットに書かれ、C の時点までスロットに残っているか。
-// 番地が逃げたスロットについては、コンパイラは「後の呼び出しがスロットを
-// 読むかもしれない」と考えるので、store を省略したり遅らせたりできない
-// (volatile な store も同じ)。その後で上書きも lifetime の終了も無ければ、
-// v は C の時点でスタック上にある。RB_GC_GUARD(v) をどこに置いても、
-// v が書き換えられずスロットが生きている間は v が守られるのはこのため。
+// Whether v is stored to the slot and stays there until C. For a slot whose
+// address has escaped, the compiler must assume that later calls may read it,
+// so it cannot remove or delay stores to it (nor volatile stores). Unless the
+// slot is overwritten or its lifetime ends afterwards, v is on the stack at C.
+// This is why RB_GC_GUARD(v) protects v wherever it is placed, as long as v is
+// not reassigned and the slot lives.
 bool isResidentInSlotAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
                         Instruction *C, const Reachability &R) {
   for (User *U : A->users()) {
@@ -463,10 +471,10 @@ bool isResidentInSlotAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
   return false;
 }
 
-// v が、番地の逃げたスロットから load された値で、C の時点までスロットに
-// 残っているか。load した時点ではスロットは v を保持しており、その後
-// 上書きも lifetime の終了も無ければ C の時点でも保持している
-// (FilePathValue(v) の後に v = ... と代入し直した値など)。
+// Whether v is loaded from a slot whose address has escaped and stays there
+// until C. The slot holds v when it is loaded, and still does at C unless it is
+// overwritten or its lifetime ends (e.g. a value reassigned with v = ... after
+// FilePathValue(v)).
 bool isLoadedFromResidentSlot(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
                               Instruction *C, const Reachability &R) {
   auto *LI = dyn_cast<LoadInst>(A);
@@ -478,9 +486,8 @@ bool isLoadedFromResidentSlot(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
          !lifetimeMayEndBetween(Slot, LI, C, R);
 }
 
-// v が C の時点でスタック上のスロットに残っているか。phi は、すべての
-// incoming 値が残っていれば残っている (どの経路から来ても、その経路の値が
-// スロットにある)。
+// Whether v is in a stack slot at C. A phi is when all of its incoming values
+// are (whichever path it comes from, that path's value is in the slot).
 bool isResidentAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
                   Instruction *C, const Reachability &R, unsigned Depth = 0) {
   if (isResidentInSlotAt(A, Aliases, C, R) ||
@@ -494,7 +501,7 @@ bool isResidentAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
   });
 }
 
-// C から (C 自身も含めて) 到達しうる、X の実際の使用があるか
+// Whether there is an actual use of X reachable from C (including C itself)
 bool hasUseReachableFrom(Value *X, Instruction *C, const Reachability &R) {
   for (User *U : X->users()) {
     auto *I = dyn_cast<Instruction>(U);
@@ -506,13 +513,13 @@ bool hasUseReachableFrom(Value *X, Instruction *C, const Reachability &R) {
   return false;
 }
 
-// C の時点で v が生きているか。次のいずれかなら生きているとみなす。
-//   - C 以降に v と等しい値の使用がある
-//   - v が (volatile な store か、番地が逃げたスロットへの store で)
-//     スロットに書かれ、C の時点まで残っている
-//   - v が番地の逃げたスロットから load され、C の時点まで残っている
-//   - v を保持するスロット (またはそれを指す値) の使用が C 以降にあり、
-//     それまでにスロットが上書きされない
+// Whether v is live at C. It is considered live if any of the following holds:
+//   - a value equal to v is used after C
+//   - v is stored to a slot (by a volatile store or a store to a slot whose
+//     address has escaped) and stays there until C
+//   - v is loaded from a slot whose address has escaped and stays there until C
+//   - a use of a slot holding v (or of a value pointing to it) follows C, and
+//     the slot is not overwritten before that
 bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
               const Instruction &Base, const Reachability &R) {
   auto Aliases = collectValueAliases(V, &DT, &Base);
@@ -532,10 +539,10 @@ bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
   return false;
 }
 
-// v の出どころ。選別の優先度に使う (値が大きいほど優先)。
-//   call:     呼び出しの戻り値。このフレームからしか参照されていない可能性が高い
-//   argument: 引数。メソッドの receiver など呼び出し元から到達可能なことが多い
-//   loaded:   メモリからの読み出し。読み出し元から到達可能なことが多い
+// Where v comes from, used to prioritize triage (greater is higher).
+//   call:     returned by a call; likely referenced only from this frame
+//   argument: an argument; often reachable from the caller (e.g. a receiver)
+//   loaded:   loaded from memory; often reachable from where it was loaded
 enum class Origin { Other, Loaded, Argument, Call };
 
 StringRef originName(Origin O) {
@@ -566,7 +573,7 @@ Origin originOf(Value *V, SmallPtrSetImpl<Value *> &Visited) {
   else if (auto *SI = dyn_cast<SelectInst>(V))
     Sources.append({SI->getTrueValue(), SI->getFalseValue()});
   else if (auto *LI = dyn_cast<LoadInst>(V)) {
-    // 番地を取られた変数のスロットなら、そこへ store された値をたどる
+    // For a slot of an address-taken variable, follow the values stored to it
     if (!isa<AllocaInst>(LI->getPointerOperand()))
       return Origin::Loaded;
     for (User *U : LI->getPointerOperand()->users())

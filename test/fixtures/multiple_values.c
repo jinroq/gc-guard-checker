@@ -1,6 +1,6 @@
 #include "ruby/ruby.h"
 
-/* a は guard されているが b はされていない。b だけを報告する */
+/* a is guarded but b is not. Only b is reported. */
 VALUE bad_one_of_two_values(VALUE a, VALUE b)
 {
     const char *pa = RSTRING_PTR(a);

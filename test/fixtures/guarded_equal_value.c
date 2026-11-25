@@ -1,9 +1,9 @@
 #include "ruby/ruby.h"
 
-/* cur == obj と分かった範囲では、コンパイラが obj の代わりに cur を
- * 使うことがある。obj が guard されていれば cur も生きているので報告しない
- * (concurrent_set_try_resize_without_locking の形。acquire load があると
- * obj はスロットから読み直され、GVN が cur の方を残す) */
+/* Where cur == obj is known, the compiler may use cur instead of obj. obj is
+ * guarded, so cur is live too and it is not reported (the shape in
+ * concurrent_set_try_resize_without_locking: with an acquire load, obj is
+ * reloaded from its slot and GVN keeps cur). */
 VALUE ok_guarded_equal_value(VALUE *slot, VALUE obj)
 {
     VALUE cur = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
@@ -15,8 +15,8 @@ VALUE ok_guarded_equal_value(VALUE *slot, VALUE obj)
     return INT2FIX(c);
 }
 
-/* 比較はしているが、等しくない側でポインタを取っている。cur の guard は
- * obj を守らないので報告する (境界) */
+/* The values are compared, but the pointer is taken on the unequal side. The
+ * guard of obj does not protect cur, so it is reported (boundary). */
 VALUE bad_guard_on_unequal_value(VALUE *slot, VALUE obj)
 {
     VALUE cur = __atomic_load_n(slot, __ATOMIC_ACQUIRE);

@@ -1,7 +1,7 @@
 #include "ruby/ruby.h"
 
-/* p の最後の使用より後に RB_GC_GUARD(str) があるので、rb_ary_new() の
- * 時点で str は生きている。報告しない */
+/* RB_GC_GUARD(str) comes after the last use of p, so str is live at
+ * rb_ary_new(). Not reported. */
 VALUE ok_guard_after_use(VALUE str)
 {
     const char *p = RSTRING_PTR(str);

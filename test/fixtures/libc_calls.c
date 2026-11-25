@@ -2,7 +2,8 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 
-/* fstat などの libc 関数は Ruby のコードを呼び返さないので GC を起こさない */
+/* libc functions such as fstat never call back into Ruby, so they do not
+ * trigger GC. */
 VALUE ok_libc_call_between(VALUE str, int fd)
 {
     struct stat st;
@@ -11,8 +12,8 @@ VALUE ok_libc_call_between(VALUE str, int fd)
     return INT2FIX(p[0] + st.st_size);
 }
 
-/* qsort のようにコールバックを受け取る呼び出しは、コールバックが GC を
- * 起こしうるので報告する (境界) */
+/* A call that receives a callback, like qsort, may trigger GC through the
+ * callback, so it is reported (boundary). */
 int compare_with_gc(const void *a, const void *b);
 
 VALUE bad_libc_call_with_callback(VALUE str, void *base, size_t n)

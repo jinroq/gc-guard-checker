@@ -1,7 +1,7 @@
 #include "ruby/ruby.h"
 
-/* 片方の分岐だけで GC を起こしうる呼び出しがある。その経路では str が
- * 死んでいるので報告する */
+/* Only one branch has a call that may trigger GC. str is dead on that path,
+ * so it is reported. */
 VALUE bad_gc_in_one_branch(VALUE str, VALUE flag)
 {
     const char *p = RSTRING_PTR(str);
