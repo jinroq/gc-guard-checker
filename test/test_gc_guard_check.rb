@@ -94,6 +94,18 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_equal(["bad_guard_on_unequal_value"], reported_functions("guarded_equal_value.c"))
   end
 
+  def test_report_includes_origin_of_value
+    origins = analyze("value_origins.c").lines.grep(REPORT_RE).to_h do |l|
+      [l[REPORT_RE, 1], l[/ \[origin=(\w+)\]$/, 1]]
+    end
+    assert_equal({
+      "bad_origin_call" => "call",
+      "bad_origin_argument" => "argument",
+      "bad_origin_loaded" => "loaded",
+      "bad_origin_phi_with_call" => "call",
+    }, origins)
+  end
+
   private
 
   def reported_functions(fixture)

@@ -310,6 +310,58 @@ bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
   return false;
 }
 
+// v の出どころ。選別の優先度に使う (値が大きいほど優先)。
+//   call:     呼び出しの戻り値。このフレームからしか参照されていない可能性が高い
+//   argument: 引数。メソッドの receiver など呼び出し元から到達可能なことが多い
+//   loaded:   メモリからの読み出し。読み出し元から到達可能なことが多い
+enum class Origin { Other, Loaded, Argument, Call };
+
+StringRef originName(Origin O) {
+  switch (O) {
+  case Origin::Call:
+    return "call";
+  case Origin::Argument:
+    return "argument";
+  case Origin::Loaded:
+    return "loaded";
+  case Origin::Other:
+    return "other";
+  }
+  llvm_unreachable("unknown origin");
+}
+
+Origin originOf(Value *V, SmallPtrSetImpl<Value *> &Visited) {
+  if (!Visited.insert(V).second)
+    return Origin::Other;
+  if (isa<Argument>(V))
+    return Origin::Argument;
+  if (isa<CallBase>(V))
+    return Origin::Call;
+  SmallVector<Value *, 4> Sources;
+  if (auto *PN = dyn_cast<PHINode>(V))
+    Sources.append(PN->incoming_values().begin(), PN->incoming_values().end());
+  else if (auto *SI = dyn_cast<SelectInst>(V))
+    Sources.append({SI->getTrueValue(), SI->getFalseValue()});
+  else if (auto *LI = dyn_cast<LoadInst>(V)) {
+    // 番地を取られた変数のスロットなら、そこへ store された値をたどる
+    if (!isa<AllocaInst>(LI->getPointerOperand()))
+      return Origin::Loaded;
+    for (User *U : LI->getPointerOperand()->users())
+      if (auto *St = dyn_cast<StoreInst>(U);
+          St && St->getPointerOperand() == LI->getPointerOperand())
+        Sources.push_back(St->getValueOperand());
+  }
+  Origin Best = Origin::Other;
+  for (Value *Src : Sources)
+    Best = std::max(Best, originOf(Src, Visited));
+  return Best;
+}
+
+Origin originOf(Value *V) {
+  SmallPtrSet<Value *, 8> Visited;
+  return originOf(V, Visited);
+}
+
 void printLocation(raw_ostream &OS, const Instruction &I) {
   if (const DebugLoc &DL = I.getDebugLoc())
     OS << DL->getFilename() << ":" << DL.getLine();
@@ -330,7 +382,8 @@ void report(Function &F, Value *V, CallBase &C, Instruction &Use) {
     OS << "indirect call";
   OS << " at ";
   printLocation(OS, C);
-  OS << " without keeping it alive\n";
+  OS << " without keeping it alive [origin=" << originName(originOf(V))
+     << "]\n";
 }
 
 struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
