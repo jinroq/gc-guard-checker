@@ -214,6 +214,42 @@ variadic_direct_caller(VALUE self)
     return bad_variadic_method_called_directly(1, args, self);
 }
 
+/* With argc == -2, the arguments are passed as an Array that the VM makes for
+ * the call, which is not on the VM stack. Reported. */
+static VALUE
+bad_method_args_array(VALUE self, VALUE args)
+{
+    const VALUE *p = RARRAY_CONST_PTR(args);
+    rb_ary_new();
+    return p[0];
+}
+
+/* The receiver of a method with argc == -2 is on the VM stack. Not
+ * reported. */
+static VALUE
+ok_method_receiver_with_args_array(VALUE self, VALUE args)
+{
+    const char *p = RSTRING_PTR(self);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+/* When argc is not a constant, which arguments are on the VM stack is not
+ * known. Reported. */
+static VALUE
+bad_method_with_unknown_argc(VALUE self, VALUE str)
+{
+    const char *p = RSTRING_PTR(str);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+void
+define_with_argc(VALUE c, int argc)
+{
+    rb_define_method(c, "j", bad_method_with_unknown_argc, argc);
+}
+
 void
 Init_argument_kept_by_callers(void)
 {
@@ -224,4 +260,6 @@ Init_argument_kept_by_callers(void)
     rb_define_method(c, "d", bad_method_called_with_temporary, 1);
     rb_define_method(c, "e", bad_method_writing_argv, -1);
     rb_define_method(c, "f", bad_variadic_method_called_directly, -1);
+    rb_define_method(c, "g", bad_method_args_array, -2);
+    rb_define_method(c, "h", ok_method_receiver_with_args_array, -2);
 }

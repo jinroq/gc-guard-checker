@@ -153,9 +153,9 @@ class TestGCGuardCheck < Test::Unit::TestCase
 
   def test_argument_kept_alive_by_callers
     assert_equal(["bad_callback", "bad_callee_of_mixed_callers", "bad_callee_of_temporary",
-                  "bad_external_callee", "bad_method_called_with_temporary",
-                  "bad_method_writing_argv", "bad_second_argument_not_kept",
-                  "bad_variadic_method_called_directly"],
+                  "bad_external_callee", "bad_method_args_array", "bad_method_called_with_temporary",
+                  "bad_method_with_unknown_argc", "bad_method_writing_argv",
+                  "bad_second_argument_not_kept", "bad_variadic_method_called_directly"],
                  reported_functions("argument_kept_by_callers.c"))
   end
 

@@ -746,9 +746,31 @@ private:
     // Whether all the uses are known: direct calls and method definitions
     bool Known = false;
     SmallVector<CallBase *, 4> Calls;
-    bool DefinedAsMethod = false;
-    // Whether every method definition has argc == -1
-    bool AllVariadic = true;
+    // The kinds of argc in the method definitions. With argc >= 0, the
+    // receiver and the arguments are on the VM stack; with -1, the receiver
+    // (the third argument) and argv; with -2, only the receiver (the first
+    // argument), as the arguments are in an Array made for the call.
+    bool DefinedWithFixedArgc = false;
+    bool DefinedWithArgcM1 = false;
+    bool DefinedWithArgcM2 = false;
+    bool DefinedWithUnknownArgc = false;
+
+    bool definedAsMethod() const {
+      return DefinedWithFixedArgc || DefinedWithArgcM1 || DefinedWithArgcM2 ||
+             DefinedWithUnknownArgc;
+    }
+
+    // Whether the argument is on the VM stack in every method definition
+    bool isArgumentOnVMStack(unsigned ArgNo) const {
+      return !DefinedWithUnknownArgc && (!DefinedWithArgcM1 || ArgNo == 2) &&
+             (!DefinedWithArgcM2 || ArgNo == 0);
+    }
+
+    // Whether argv is on the VM stack in every method definition
+    bool isArgvOnVMStack() const {
+      return DefinedWithArgcM1 && !DefinedWithFixedArgc && !DefinedWithArgcM2 &&
+             !DefinedWithUnknownArgc;
+    }
   };
 
   // For a function defining a method, the indices of the function pointer and
@@ -788,10 +810,16 @@ private:
         FU.Known = false;
         break;
       }
-      FU.DefinedAsMethod = true;
       auto *Argc = dyn_cast<ConstantInt>(CB->getArgOperand(Def->second));
-      if (!Argc || Argc->getSExtValue() != -1)
-        FU.AllVariadic = false;
+      int64_t N = Argc ? Argc->getSExtValue() : -3;
+      if (N >= 0)
+        FU.DefinedWithFixedArgc = true;
+      else if (N == -1)
+        FU.DefinedWithArgcM1 = true;
+      else if (N == -2)
+        FU.DefinedWithArgcM2 = true;
+      else
+        FU.DefinedWithUnknownArgc = true;
     }
     return FU;
   }
@@ -803,7 +831,10 @@ private:
     if (!InProgress.insert(A).second)
       return false;
     const FunctionUses &FU = usesOf(A->getParent());
-    bool Kept = FU.Known && all_of(FU.Calls, [&](CallBase *CB) {
+    bool Kept = FU.Known &&
+                (!FU.definedAsMethod() ||
+                 FU.isArgumentOnVMStack(A->getArgNo())) &&
+                all_of(FU.Calls, [&](CallBase *CB) {
       return CB->arg_size() > A->getArgNo() &&
              isKeptAcrossCall(CB->getArgOperand(A->getArgNo()), CB);
     });
@@ -835,8 +866,8 @@ private:
     if (!Argv || Argv->getArgNo() != 1 || !Argv->getType()->isPointerTy())
       return false;
     const FunctionUses &FU = usesOf(Argv->getParent());
-    return FU.Known && FU.Calls.empty() && FU.DefinedAsMethod &&
-           FU.AllVariadic && !isWrittenThrough(Argv);
+    return FU.Known && FU.Calls.empty() && FU.isArgvOnVMStack() &&
+           !isWrittenThrough(Argv);
   }
 
   static bool isWrittenThrough(Value *Ptr) {

@@ -48,7 +48,8 @@ reported when `tmp` is dead, since `rb_str_new` allocates before copying.
   - the receiver and the arguments of a method defined with
     `rb_define_method` and friends, which are on the VM stack during the call
     (with `argc == -1`, the values in `argv` too, unless the method writes to
-    `argv` or is also called directly), or
+    `argv` or is also called directly; with `argc == -2`, only the receiver,
+    as the arguments are in an `Array` made for the call), or
   - an argument of a `static` function, when every caller keeps the passed
     value alive across the call in the same way. Functions with external
     linkage, or whose address is used otherwise (as a callback, in a table,
