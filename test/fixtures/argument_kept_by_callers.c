@@ -1,0 +1,227 @@
+#include "ruby/ruby.h"
+
+#define NOINLINE __attribute__((noinline))
+
+/* A method registered with rb_define_method. The VM keeps the receiver and
+ * the arguments on its stack during the call, so it is not reported. */
+static VALUE
+ok_method_argument(VALUE self, VALUE str)
+{
+    const char *p = RSTRING_PTR(str);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+/* With argc == -1, the arguments are in argv, which points into the VM stack.
+ * Not reported. */
+static VALUE
+ok_method_argv(int argc, VALUE *argv, VALUE self)
+{
+    const char *p = RSTRING_PTR(argv[0]);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+/* A static function whose only caller uses the argument after the call. Not
+ * reported. */
+static NOINLINE VALUE
+ok_callee_of_keeping_caller(VALUE str)
+{
+    const char *p = RSTRING_PTR(str);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+VALUE
+keeping_caller(VALUE str)
+{
+    VALUE r = ok_callee_of_keeping_caller(str);
+    return rb_assoc_new(r, str);
+}
+
+/* The only caller passes its own argument, which the VM keeps since the caller
+ * is a method. Not reported. */
+static NOINLINE VALUE
+ok_callee_of_method(VALUE str)
+{
+    const char *p = RSTRING_PTR(str);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+static VALUE
+method_calling_callee(VALUE self, VALUE str)
+{
+    return ok_callee_of_method(str);
+}
+
+/* One caller passes a constant, which is not an object in the heap, and the
+ * other keeps the argument. Not reported (with two callers, the constant is
+ * not propagated into the function). */
+static NOINLINE VALUE
+ok_callee_of_constant_and_keeping_callers(VALUE str)
+{
+    const char *p = RSTRING_PTR(str);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+VALUE
+constant_caller(void)
+{
+    return ok_callee_of_constant_and_keeping_callers(Qnil);
+}
+
+VALUE
+keeping_caller_with_constant_sibling(VALUE str)
+{
+    VALUE r = ok_callee_of_constant_and_keeping_callers(str);
+    return rb_assoc_new(r, str);
+}
+
+/* The only caller passes a new string that it does not use after the call, so
+ * it is reported. */
+static NOINLINE VALUE
+bad_callee_of_temporary(VALUE str)
+{
+    const char *p = RSTRING_PTR(str);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+VALUE
+temporary_caller(void)
+{
+    return bad_callee_of_temporary(rb_str_new_cstr("x"));
+}
+
+/* One of the callers keeps the argument and the other does not. All the
+ * callers have to keep it, so it is reported. */
+static NOINLINE VALUE
+bad_callee_of_mixed_callers(VALUE str)
+{
+    const char *p = RSTRING_PTR(str);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+VALUE
+mixed_caller_keeping(VALUE str)
+{
+    VALUE r = bad_callee_of_mixed_callers(str);
+    return rb_assoc_new(r, str);
+}
+
+VALUE
+mixed_caller_temporary(void)
+{
+    return bad_callee_of_mixed_callers(rb_str_new_cstr("x"));
+}
+
+/* The caller keeps the first argument but not the second, from which the
+ * pointer is derived. Reported. */
+static NOINLINE VALUE
+bad_second_argument_not_kept(VALUE a, VALUE str)
+{
+    const char *p = RSTRING_PTR(str);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+VALUE
+first_argument_keeping_caller(VALUE a)
+{
+    VALUE r = bad_second_argument_not_kept(a, rb_str_new_cstr("x"));
+    return rb_assoc_new(r, a);
+}
+
+/* A function with external linkage may be called from other files, whose
+ * callers are unknown. Reported even though the caller here keeps it. */
+NOINLINE VALUE
+bad_external_callee(VALUE str)
+{
+    const char *p = RSTRING_PTR(str);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+VALUE
+external_callee_caller(VALUE str)
+{
+    VALUE r = bad_external_callee(str);
+    return rb_assoc_new(r, str);
+}
+
+/* A static function whose address is used other than for defining a method,
+ * here as a callback of rb_protect. Its callers are unknown, so it is
+ * reported. */
+static VALUE
+bad_callback(VALUE str)
+{
+    const char *p = RSTRING_PTR(str);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+VALUE
+callback_user(VALUE str)
+{
+    int state;
+    VALUE r = rb_protect(bad_callback, str, &state);
+    return rb_assoc_new(r, str);
+}
+
+/* A method that is also called directly with a new string. Reported. */
+static NOINLINE VALUE
+bad_method_called_with_temporary(VALUE self, VALUE str)
+{
+    const char *p = RSTRING_PTR(str);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+VALUE
+method_direct_caller(VALUE self)
+{
+    return bad_method_called_with_temporary(self, rb_str_new_cstr("x"));
+}
+
+/* A method with argc == -1 that writes to argv. argv is then not trusted to
+ * hold the values passed by the VM, so it is reported. */
+static VALUE
+bad_method_writing_argv(int argc, VALUE *argv, VALUE self)
+{
+    argv[1] = Qnil;
+    const char *p = RSTRING_PTR(argv[0]);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+/* A method with argc == -1 that is also called directly with an array of new
+ * strings. Reported. */
+static NOINLINE VALUE
+bad_variadic_method_called_directly(int argc, VALUE *argv, VALUE self)
+{
+    const char *p = RSTRING_PTR(argv[0]);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+VALUE
+variadic_direct_caller(VALUE self)
+{
+    VALUE args[1] = {rb_str_new_cstr("x")};
+    return bad_variadic_method_called_directly(1, args, self);
+}
+
+void
+Init_argument_kept_by_callers(void)
+{
+    VALUE c = rb_define_class("ArgumentKeptByCallers", rb_cObject);
+    rb_define_method(c, "a", ok_method_argument, 1);
+    rb_define_method(c, "b", ok_method_argv, -1);
+    rb_define_singleton_method(c, "c", method_calling_callee, 1);
+    rb_define_method(c, "d", bad_method_called_with_temporary, 1);
+    rb_define_method(c, "e", bad_method_writing_argv, -1);
+    rb_define_method(c, "f", bad_variadic_method_called_directly, -1);
+}

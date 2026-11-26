@@ -16,6 +16,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
@@ -47,6 +48,15 @@ public:
     if (FB == TB && From->comesBefore(To))
       return true;
     return successorsReach(FB).test(Index.lookup(TB));
+  }
+
+  // Whether To may be executed after From has completed. Unlike reaches, To
+  // == From only when the instruction can be executed again (in a loop).
+  bool reachesAfter(const Instruction *From, const Instruction *To) const {
+    if (From != To)
+      return reaches(From, To);
+    const BasicBlock *B = From->getParent();
+    return successorsReach(B).test(Index.lookup(B));
   }
 
 private:
@@ -504,17 +514,22 @@ bool isResidentAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
   });
 }
 
-// Whether there is an actual use of X reachable from C (including C itself)
-bool hasUseReachableFrom(Value *X, Instruction *C, const Reachability &R) {
+// Whether there is an actual use of X reachable from C. A use at C itself
+// counts when IncludeC is set: the callee receives v and is expected to keep
+// it, as rb_str_resize(str, ...) does.
+bool hasUseReachableFrom(Value *X, Instruction *C, const Reachability &R,
+                         bool IncludeC) {
   for (User *U : X->users()) {
     auto *I = dyn_cast<Instruction>(U);
     if (!I || I->isLifetimeStartOrEnd())
       continue;
-    if (R.reaches(C, I))
+    if (IncludeC ? R.reaches(C, I) : R.reachesAfter(C, I))
       return true;
   }
   return false;
 }
+
+class CallerAnalysis;
 
 // Whether v is live at C. It is considered live if any of the following holds:
 //   - a value equal to v is used after C
@@ -523,11 +538,167 @@ bool hasUseReachableFrom(Value *X, Instruction *C, const Reachability &R) {
 //   - v is loaded from a slot whose address has escaped and stays there until C
 //   - a use of a slot holding v (or of a value pointing to it) follows C, and
 //     the slot is not overwritten before that
+//   - a value equal to v is kept alive outside this frame during the whole
+//     call of the function (see CallerAnalysis)
 bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
-              const Instruction &Base, const Reachability &R) {
+              const Instruction &Base, const Reachability &R,
+              CallerAnalysis &CA, bool IncludeC = true);
+
+// Tells whether a value in a function is kept alive by its callers during the
+// whole call, so that the function does not have to keep it:
+//   - The receiver and the arguments of a method defined with
+//     rb_define_method and friends are on the VM stack during the call. With
+//     argc == -1, so are the values in argv.
+//   - An argument of a function with local linkage, all of whose callers are
+//     in this module, when every caller keeps the passed value alive across
+//     the call (it is live after the call in the caller).
+// A function with external linkage, or whose address is used otherwise (as a
+// callback, stored in a table, ...), may have unknown callers.
+class CallerAnalysis {
+public:
+  explicit CallerAnalysis(FunctionAnalysisManager &FAM) : FAM(FAM) {}
+
+  bool isKeptAlive(Value *V) {
+    if (auto *A = dyn_cast<Argument>(V))
+      return isArgumentKeptAlive(A);
+    return isLoadedFromMethodArgv(V);
+  }
+
+  const Reachability &reachabilityOf(Function &F) {
+    auto &Slot = Reach[&F];
+    if (!Slot)
+      Slot = std::make_unique<Reachability>(F);
+    return *Slot;
+  }
+
+private:
+  struct FunctionUses {
+    // Whether all the uses are known: direct calls and method definitions
+    bool Known = false;
+    SmallVector<CallBase *, 4> Calls;
+    bool DefinedAsMethod = false;
+    // Whether every method definition has argc == -1
+    bool AllVariadic = true;
+  };
+
+  // For a function defining a method, the indices of the function pointer and
+  // argc arguments
+  static std::optional<std::pair<unsigned, unsigned>>
+  methodDefinitionArgs(StringRef Name) {
+    static const StringSet<> WithClass = {
+        "rb_define_method",           "rb_define_method_id",
+        "rb_define_private_method",   "rb_define_protected_method",
+        "rb_define_singleton_method", "rb_define_module_function",
+    };
+    if (WithClass.contains(Name))
+      return std::make_pair(2u, 3u);
+    if (Name == "rb_define_global_function")
+      return std::make_pair(1u, 2u);
+    return std::nullopt;
+  }
+
+  const FunctionUses &usesOf(Function *F) {
+    auto [It, Inserted] = Uses.try_emplace(F);
+    FunctionUses &FU = It->second;
+    if (!Inserted)
+      return FU;
+    if (!F->hasLocalLinkage())
+      return FU;
+    FU.Known = true;
+    for (Use &U : F->uses()) {
+      auto *CB = dyn_cast<CallBase>(U.getUser());
+      if (CB && CB->isCallee(&U)) {
+        FU.Calls.push_back(CB);
+        continue;
+      }
+      const Function *Callee = CB ? CB->getCalledFunction() : nullptr;
+      auto Def = Callee ? methodDefinitionArgs(Callee->getName()) : std::nullopt;
+      if (!Def || U.getOperandNo() != Def->first ||
+          CB->arg_size() <= Def->second) {
+        FU.Known = false;
+        break;
+      }
+      FU.DefinedAsMethod = true;
+      auto *Argc = dyn_cast<ConstantInt>(CB->getArgOperand(Def->second));
+      if (!Argc || Argc->getSExtValue() != -1)
+        FU.AllVariadic = false;
+    }
+    return FU;
+  }
+
+  bool isArgumentKeptAlive(Argument *A) {
+    if (auto It = ArgCache.find(A); It != ArgCache.end())
+      return It->second;
+    // Recursion: assume not kept, which only makes more reports
+    if (!InProgress.insert(A).second)
+      return false;
+    const FunctionUses &FU = usesOf(A->getParent());
+    bool Kept = FU.Known && all_of(FU.Calls, [&](CallBase *CB) {
+      return CB->arg_size() > A->getArgNo() &&
+             isKeptAcrossCall(CB->getArgOperand(A->getArgNo()), CB);
+    });
+    InProgress.erase(A);
+    return ArgCache[A] = Kept;
+  }
+
+  bool isKeptAcrossCall(Value *Arg, CallBase *CB) {
+    // A constant (Qnil, a Fixnum, ...) is not an object made in the heap at
+    // run time. (Constants also have no use lists to analyze.)
+    if (isa<Constant>(Arg))
+      return true;
+    Function &Caller = *CB->getFunction();
+    auto &DT = FAM.getResult<DominatorTreeAnalysis>(Caller);
+    return isLiveAt(Arg, CB, DT, *CB, reachabilityOf(Caller), *this,
+                    /*IncludeC=*/false);
+  }
+
+  // Whether V is loaded from argv of a method with argc == -1 that is called
+  // only by the VM and does not write to argv
+  bool isLoadedFromMethodArgv(Value *V) {
+    auto *LI = dyn_cast<LoadInst>(V);
+    if (!LI)
+      return false;
+    Value *P = LI->getPointerOperand();
+    while (auto *GEP = dyn_cast<GEPOperator>(P))
+      P = GEP->getPointerOperand();
+    auto *Argv = dyn_cast<Argument>(P);
+    if (!Argv || Argv->getArgNo() != 1 || !Argv->getType()->isPointerTy())
+      return false;
+    const FunctionUses &FU = usesOf(Argv->getParent());
+    return FU.Known && FU.Calls.empty() && FU.DefinedAsMethod &&
+           FU.AllVariadic && !isWrittenThrough(Argv);
+  }
+
+  static bool isWrittenThrough(Value *Ptr) {
+    SmallVector<Value *, 8> Worklist{Ptr};
+    SmallPtrSet<Value *, 8> Seen;
+    while (!Worklist.empty()) {
+      Value *P = Worklist.pop_back_val();
+      if (!Seen.insert(P).second)
+        continue;
+      for (User *U : P->users()) {
+        if (auto *SI = dyn_cast<StoreInst>(U); SI && SI->getPointerOperand() == P)
+          return true;
+        if (isa<GetElementPtrInst, PHINode, SelectInst>(U))
+          Worklist.push_back(U);
+      }
+    }
+    return false;
+  }
+
+  FunctionAnalysisManager &FAM;
+  DenseMap<Function *, FunctionUses> Uses;
+  DenseMap<Argument *, bool> ArgCache;
+  SmallPtrSet<Argument *, 8> InProgress;
+  DenseMap<Function *, std::unique_ptr<Reachability>> Reach;
+};
+
+bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
+              const Instruction &Base, const Reachability &R,
+              CallerAnalysis &CA, bool IncludeC) {
   auto Aliases = collectValueAliases(V, &DT, &Base);
   for (Value *A : Aliases) {
-    if (hasUseReachableFrom(A, C, R))
+    if (hasUseReachableFrom(A, C, R, IncludeC))
       return true;
     if (isResidentAt(A, Aliases, C, R))
       return true;
@@ -535,10 +706,13 @@ bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
       if (mayBeOverwrittenBefore(Slot, A, Aliases, C, R))
         continue;
       for (Value *H : collectHolders(Slot))
-        if (hasUseReachableFrom(H, C, R))
+        if (hasUseReachableFrom(H, C, R, IncludeC))
           return true;
     }
   }
+  for (Value *A : Aliases)
+    if (CA.isKeptAlive(A))
+      return true;
   return false;
 }
 
@@ -619,13 +793,24 @@ void report(Function &F, Value *V, CallBase &C, Instruction &Use) {
      << "]\n";
 }
 
+// A module pass, since whether an argument is kept alive depends on the
+// callers in the module
 struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
-  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-    if (F.isDeclaration())
-      return PreservedAnalyses::all();
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
+    auto &FAM =
+        MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+    CallerAnalysis CA(FAM);
+    for (Function &F : M)
+      if (!F.isDeclaration())
+        checkFunction(F, FAM, CA);
+    return PreservedAnalyses::all();
+  }
+
+  static void checkFunction(Function &F, FunctionAnalysisManager &FAM,
+                            CallerAnalysis &CA) {
     auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
     auto &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
-    Reachability R(F);
+    const Reachability &R = CA.reachabilityOf(F);
     SmallVector<CallBase *, 16> GCCalls;
     SmallVector<IntToPtrInst *, 16> Bases;
     for (Instruction &I : instructions(F)) {
@@ -644,7 +829,7 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
       if (!isUsedAsRubyObject(Accesses))
         continue;
       for (CallBase *C : GCCalls) {
-        if (!R.reaches(Base, C) || isLiveAt(V, C, DT, *Base, R))
+        if (!R.reaches(Base, C) || isLiveAt(V, C, DT, *Base, R, CA))
           continue;
         auto *Use = find_if(Accesses, [&](Instruction *U) {
           return R.reaches(C, U);
@@ -656,7 +841,6 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
         }
       }
     }
-    return PreservedAnalyses::all();
   }
   static bool isRequired() { return true; }
 };
@@ -666,11 +850,11 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "GCGuardCheck", "0.1", [](PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
-                [](StringRef Name, FunctionPassManager &FPM,
+                [](StringRef Name, ModulePassManager &MPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
                   if (Name != "gc-guard-check")
                     return false;
-                  FPM.addPass(GCGuardCheckPass());
+                  MPM.addPass(GCGuardCheckPass());
                   return true;
                 });
           }};

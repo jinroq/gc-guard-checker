@@ -40,6 +40,16 @@ reported when `tmp` is dead, since `rb_str_new` allocates before copying.
   address escapes, the compiler cannot remove or delay stores to the slot, so
   `RB_GC_GUARD` anywhere in the function protects `v` as long as `v` is not
   reassigned and the slot lives.
+- `v` is kept alive by the callers during the whole call of the function:
+  - the receiver and the arguments of a method defined with
+    `rb_define_method` and friends, which are on the VM stack during the call
+    (with `argc == -1`, the values in `argv` too, unless the method writes to
+    `argv` or is also called directly), or
+  - an argument of a `static` function, when every caller keeps the passed
+    value alive across the call in the same way. Functions with external
+    linkage, or whose address is used otherwise (as a callback, in a table,
+    ...), may have unknown callers, so their arguments are not considered
+    kept.
 
 A call is considered not to trigger GC when it
 
@@ -113,7 +123,7 @@ kept in `out/<file>.ll`.
 |---|---|---|
 | `call` | Returned by a call in the function, e.g. a new object | High: likely referenced only from this frame |
 | `loaded` | Loaded from memory | Lower: often reachable from where it was loaded |
-| `argument` | A function argument | Lower: the receiver and arguments of a method are on the VM stack |
+| `argument` | A function argument | Lower: often kept by a caller in another file |
 
 Set `WITH_EXT=0` to skip the extensions. A few files that need special compiler
 flags (the SIMD implementations of BLAKE3) cannot be compiled by the script;
@@ -124,9 +134,10 @@ reports are incomplete, so the script lists the file and exits with an error.
 
 Reports are candidates to be checked by reading the code, not confirmed bugs.
 
-- The analysis is intraprocedural. It cannot tell that `v` is reachable from
-  elsewhere: a global table, an object field, or the caller's frame. Most
-  reports with `origin=argument` are of this kind.
+- Apart from the callers of methods and `static` functions above, it cannot
+  tell that `v` is reachable from elsewhere: a global table, an object field,
+  or the frame of a caller in another file. Most reports with
+  `origin=argument` and `origin=loaded` are of this kind.
 - Library functions that LLVM does not know, such as OpenSSL's, are treated as
   possibly triggering GC.
 - Indirect calls are treated as possibly triggering GC.
