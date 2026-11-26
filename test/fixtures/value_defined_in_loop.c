@@ -33,6 +33,25 @@ ok_ptr_used_before_gc_in_loop(long n)
     return LONG2FIX(sum);
 }
 
+/* p is carried to the next iteration by a phi and used there after the GC
+ * call. It points into the string of the previous iteration, which is no
+ * longer used. Reported. */
+long
+bad_ptr_carried_to_next_iteration(long n)
+{
+    const char *prev = 0;
+    long sum = 0;
+    for (long i = 0; i < n; i++) {
+        VALUE s = rb_str_new_cstr("x");
+        const char *p = RSTRING_PTR(s);
+        if (prev)
+            sum += prev[0];
+        rb_ary_new();
+        prev = p;
+    }
+    return sum;
+}
+
 /* s is used after the GC call in the same iteration. Not reported. */
 VALUE
 ok_value_defined_in_loop_used_after(long n)

@@ -557,13 +557,19 @@ SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
   auto HoldsAcrossCalls = [](StoreInst *SI, AllocaInst *Slot) {
     return Slot && (SI->isVolatile() || isEscaped(Slot));
   };
-  // What an instruction does to the slots holding v: puts v into a slot, takes
-  // it out, or copies the content of another slot (link_orig = link, which
-  // loads link from its slot)
+  // The state of a path has a bit for each slot, set while the slot holds v,
+  // and a bit for each load copying a slot (link_orig = link, which loads link
+  // from its slot and stores it), set if the loaded value is v. The content of
+  // the slot is taken when it is loaded, as the slot may change before the
+  // store.
+  constexpr unsigned MaxSlots = 32, MaxCopies = 32;
+  constexpr uint64_t SlotBits = (uint64_t(1) << MaxSlots) - 1;
+  // What an instruction does to a bit: sets it, clears it, or copies another
+  // bit to it
   enum class Kind { Put, Take, Copy };
   struct Effect {
     Kind K;
-    unsigned Slot;
+    unsigned Bit;
     unsigned From = 0;
   };
   DenseMap<const Instruction *, Effect> Effects;
@@ -575,27 +581,37 @@ SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
     if (HoldsAcrossCalls(SI, Slot))
       Effects[SI] = {Kind::Put, IndexOf(Slot)};
   }
-  unsigned Initial = 0;
+  uint64_t Initial = 0;
   if (auto *LI = dyn_cast<LoadInst>(A))
     if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand());
         Slot && isEscaped(Slot))
-      Initial = 1u << IndexOf(Slot);
+      Initial = uint64_t(1) << IndexOf(Slot);
   // Copies from the slots found so far, which may find more slots
-  for (unsigned I = 0; I < Slots.size() && Slots.size() <= 32; ++I)
+  unsigned Copies = 0;
+  for (unsigned I = 0; I < Slots.size() && Slots.size() <= MaxSlots; ++I)
     for (User *U : Slots[I]->users()) {
       auto *LI = dyn_cast<LoadInst>(U);
       if (!LI || LI->getPointerOperand() != Slots[I])
         continue;
+      unsigned LoadBit = MaxSlots + Copies;
+      bool Copied = false;
       for (User *LU : LI->users()) {
         auto *SI = dyn_cast<StoreInst>(LU);
         if (!SI || SI->getValueOperand() != LI || Effects.count(SI))
           continue;
         AllocaInst *Slot = resolveSlot(SI->getPointerOperand());
-        if (HoldsAcrossCalls(SI, Slot))
-          Effects[SI] = {Kind::Copy, IndexOf(Slot), I};
+        if (!HoldsAcrossCalls(SI, Slot))
+          continue;
+        Effects[SI] = {Kind::Copy, IndexOf(Slot), LoadBit};
+        Copied = true;
+      }
+      if (Copied) {
+        if (++Copies > MaxCopies)
+          return Result;
+        Effects[LI] = {Kind::Copy, LoadBit, I};
       }
     }
-  if (Slots.empty() || Slots.size() > 32)
+  if (Slots.empty() || Slots.size() > MaxSlots)
     return Result;
   for (unsigned I = 0; I < Slots.size(); ++I) {
     for (StoreInst *SI : storesTo(Slots[I])) {
@@ -611,23 +627,24 @@ SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
   }
 
   auto *Def = dyn_cast<Instruction>(A);
-  SmallVector<std::pair<const BasicBlock *, unsigned>, 32> Worklist;
-  DenseSet<std::pair<const BasicBlock *, unsigned>> Seen;
-  // Scans BB from It with the slots holding v in State
+  SmallVector<std::pair<const BasicBlock *, uint64_t>, 32> Worklist;
+  DenseSet<std::pair<const BasicBlock *, uint64_t>> Seen;
+  // Scans BB from It with State
   auto Scan = [&](BasicBlock::const_iterator It, const BasicBlock *BB,
-                  unsigned State) {
+                  uint64_t State) {
     for (; It != BB->end(); ++It) {
       const Instruction *I = &*It;
       if (I == Def)
         return;
       if (isa<CallBase>(I))
-        Result[I] |= State ? CallReached : CallReached | CallReachedOutOfSlots;
+        Result[I] |= (State & SlotBits) ? CallReached
+                                        : CallReached | CallReachedOutOfSlots;
       if (auto E = Effects.find(I); E != Effects.end()) {
         const Effect &Eff = E->second;
-        unsigned Bit = 1u << Eff.Slot;
-        bool Holds = Eff.K == Kind::Put ||
-                     (Eff.K == Kind::Copy && (State & (1u << Eff.From)));
-        State = Holds ? (State | Bit) : (State & ~Bit);
+        uint64_t Bit = uint64_t(1) << Eff.Bit;
+        bool Set = Eff.K == Kind::Put ||
+                   (Eff.K == Kind::Copy && (State & (uint64_t(1) << Eff.From)));
+        State = Set ? (State | Bit) : (State & ~Bit);
       }
     }
     for (const BasicBlock *Succ : successors(BB))
@@ -1038,6 +1055,71 @@ void report(Function &F, Value *V, CallBase &C, Instruction &Use) {
      << "]\n";
 }
 
+// Tells whether the value of a pointer derived from v, observed at an access,
+// may come from the value v had at C. In a loop, v and the pointers may be
+// computed again for the next iteration, but a phi may carry a pointer of the
+// previous iteration (prev = p) past that.
+class CarriedValues {
+public:
+  CarriedValues(Value *V, Instruction *C,
+                const SmallSetVector<Value *, 16> &Derived,
+                const Reachability &R)
+      : V(V), C(C), Derived(Derived), R(R) {}
+
+  // Whether an operand of the access U may be derived from v at C
+  bool isAccessToValueAtC(Instruction *U) {
+    if (U == C)
+      return true;
+    return any_of(U->operands(), [&](Value *P) {
+      return Derived.contains(P) && isCarried(P, U);
+    });
+  }
+
+private:
+  // Whether X at To may be derived from v at C
+  bool isCarried(Value *X, const Instruction *To) {
+    if (X == V)
+      return R.reachesAfterWithSameValue(V, C, To);
+    if (!Derived.contains(X))
+      return false;
+    auto Key = std::make_pair(static_cast<const Value *>(X), To);
+    if (auto It = Memo.find(Key); It != Memo.end())
+      return It->second;
+    // Around a cycle of pointers (q = q + 1 in a loop), assume not carried
+    Memo[Key] = false;
+    bool Result = computeIsCarried(cast<Instruction>(X), To);
+    Memo[Key] = Result;
+    return Result;
+  }
+
+  bool computeIsCarried(Instruction *X, const Instruction *To) {
+    // Not computed again after C: the value at C
+    if (R.reachesAfterWithSameValue(X, C, To))
+      return true;
+    // Computed again: from what the operands are at that point
+    if (!R.reaches(X, To))
+      return false;
+    if (auto *PN = dyn_cast<PHINode>(X)) {
+      for (unsigned I = 0; I < PN->getNumIncomingValues(); ++I) {
+        const Instruction *Term = PN->getIncomingBlock(I)->getTerminator();
+        if (R.reachesAfter(C, Term) && isCarried(PN->getIncomingValue(I), Term))
+          return true;
+      }
+      return false;
+    }
+    return any_of(X->operands(), [&](Value *Q) {
+      return (Q == V || Derived.contains(Q)) && R.reachesAfter(C, X) &&
+             isCarried(Q, X);
+    });
+  }
+
+  Value *V;
+  Instruction *C;
+  const SmallSetVector<Value *, 16> &Derived;
+  const Reachability &R;
+  DenseMap<std::pair<const Value *, const Instruction *>, bool> Memo;
+};
+
 // A module pass, since whether an argument is kept alive depends on the
 // callers in the module
 struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
@@ -1070,16 +1152,18 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
       Value *V = Base->getOperand(0);
       if (Reported.contains(V))
         continue;
-      auto Accesses = collectDerivedAccesses(collectDerivedPointers(Base));
+      auto Derived = collectDerivedPointers(Base);
+      auto Accesses = collectDerivedAccesses(Derived);
       if (!isUsedAsRubyObject(Accesses))
         continue;
       for (CallBase *C : GCCalls) {
         if (!R.reaches(Base, C) || isLiveAt(V, C, DT, *Base, R, CA))
           continue;
-        // An access reached only through Base again (in the next iteration of
-        // a loop) is through a new pointer
+        // An access in the next iteration of a loop may be through a new
+        // pointer, or one carried from this iteration
+        CarriedValues Carried(V, C, Derived, R);
         auto *Use = find_if(Accesses, [&](Instruction *U) {
-          return U == C || R.reachesAfterWithSameValue(Base, C, U);
+          return Carried.isAccessToValueAtC(U);
         });
         if (Use != Accesses.end()) {
           report(F, V, *C, **Use);

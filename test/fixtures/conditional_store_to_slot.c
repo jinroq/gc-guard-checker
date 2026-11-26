@@ -44,6 +44,28 @@ ok_kept_in_either_slot(long n)
     return Qnil;
 }
 
+/* tmp is loaded from a before v is stored there, so b gets the old value of
+ * a. Then a is overwritten, and v is in no slot at the GC call. Reported. */
+void opaque(void);
+
+VALUE
+bad_copied_before_stored(VALUE old)
+{
+    VALUE a = old, b = Qnil;
+    escape(&a);
+    escape(&b);
+    VALUE v = rb_str_new_cstr("x");
+    const char *p = RSTRING_PTR(v);
+    VALUE tmp = *(volatile VALUE *)&a;
+    a = v;
+    opaque();
+    b = tmp;
+    a = Qnil;
+    rb_ary_new();
+    use(p);
+    return Qnil;
+}
+
 /* Stored on both paths, so the slot holds s at the GC call. Not reported
  * (boundary). */
 VALUE
