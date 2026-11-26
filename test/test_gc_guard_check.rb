@@ -134,6 +134,10 @@ class TestGCGuardCheck < Test::Unit::TestCase
                  reported_functions("loaded_from_escaped_slot.c"))
   end
 
+  def test_phi_with_constant_incoming_value
+    assert_equal(["bad_phi_with_constant_incoming"], reported_functions("phi_with_constant.c"))
+  end
+
   private
 
   def reported_functions(fixture)

@@ -288,7 +288,8 @@ SmallPtrSet<Value *, 8> collectValueAliases(Value *V,
 // Collects the candidate stack slots (allocas) that may hold v. A variable
 // whose address is taken by RB_GC_GUARD(v) lives in an alloca, so v is stored
 // to it or loaded from it. For a phi, only the slots common to all incoming
-// values hold it.
+// values hold it. A constant incoming value (Qnil, ...) is not an object in
+// the heap, so it imposes no condition (constants also have no use lists).
 SmallPtrSet<AllocaInst *, 4> collectSlots(Value *V, unsigned Depth = 0) {
   SmallPtrSet<AllocaInst *, 4> Slots;
   if (auto *LI = dyn_cast<LoadInst>(V); LI && !LI->isVolatile())
@@ -301,7 +302,7 @@ SmallPtrSet<AllocaInst *, 4> collectSlots(Value *V, unsigned Depth = 0) {
   if (auto *PN = dyn_cast<PHINode>(V); PN && Depth < 4) {
     std::optional<SmallPtrSet<AllocaInst *, 4>> Common;
     for (Value *In : PN->incoming_values()) {
-      if (In == PN)
+      if (In == PN || isa<Constant>(In))
         continue;
       auto InSlots = collectSlots(In, Depth + 1);
       if (!Common) {
@@ -487,7 +488,8 @@ bool isLoadedFromResidentSlot(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
 }
 
 // Whether v is in a stack slot at C. A phi is when all of its incoming values
-// are (whichever path it comes from, that path's value is in the slot).
+// are (whichever path it comes from, that path's value is in the slot), except
+// for constants, which are not objects in the heap.
 bool isResidentAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
                   Instruction *C, const Reachability &R, unsigned Depth = 0) {
   if (isResidentInSlotAt(A, Aliases, C, R) ||
@@ -497,7 +499,8 @@ bool isResidentAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
   if (!PN || Depth >= 4)
     return false;
   return all_of(PN->incoming_values(), [&](Value *In) {
-    return In == PN || isResidentAt(In, Aliases, C, R, Depth + 1);
+    return In == PN || isa<Constant>(In) ||
+           isResidentAt(In, Aliases, C, R, Depth + 1);
   });
 }
 
