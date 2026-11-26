@@ -116,6 +116,10 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_equal(["bad_libc_call_with_callback"], reported_functions("libc_calls.c"))
   end
 
+  def test_library_calls_unknown_to_llvm
+    assert_equal(["bad_zlib_deflate"], reported_functions("library_calls_unknown_to_llvm.c"))
+  end
+
   def test_guard_assignment_keeps_value_on_stack
     assert_equal(["bad_guard_assignment_overwritten"], reported_functions("guard_assignment.c"))
   end

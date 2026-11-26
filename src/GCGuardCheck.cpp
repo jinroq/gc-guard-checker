@@ -178,8 +178,26 @@ bool isKnownNonGCFunction(StringRef Name) {
       "rb_gc_writebarrier",
       // Only returns &errno
       "rb_errno_ptr",
-      // libc system call wrapper
+      // libc system call wrappers that LLVM does not know as library
+      // functions (the __*_chk ones are used with _FORTIFY_SOURCE). They
+      // never call back into Ruby; a signal handler of Ruby only records
+      // the signal.
       "fcntl",
+      "send",
+      "sendto",
+      "recv",
+      "__recv_chk",
+      "recvfrom",
+      "__recvfrom_chk",
+      "sleep",
+      "pthread_setname_np",
+      // zlib's checksums, which only compute over the buffer. Unlike them,
+      // deflate and friends allocate through the zalloc of the stream, which
+      // the zlib extension sets to a function using xmalloc.
+      "crc32",
+      "crc32_z",
+      "adler32",
+      "adler32_z",
       // The following may GC only on paths that raise and never return, so
       // they have not triggered GC when they return normally.
       // Only raises if fptr is NULL
