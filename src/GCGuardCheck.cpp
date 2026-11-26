@@ -870,6 +870,19 @@ private:
            !isWrittenThrough(Argv);
   }
 
+  // Functions checked to only read the array of VALUEs passed to them
+  static bool onlyReadsValueArray(const CallBase &CB) {
+    static const StringSet<> Names = {
+        "rb_scan_args",
+        "rb_scan_args_kw",
+    };
+    const Function *Callee = CB.getCalledFunction();
+    return Callee && Names.contains(Callee->getName());
+  }
+
+  // Whether something may write through Ptr (or what is derived from it).
+  // Any use not known to only read is considered to write: a call may write
+  // through the pointer, and so may anything after it is stored to memory.
   static bool isWrittenThrough(Value *Ptr) {
     SmallVector<Value *, 8> Worklist{Ptr};
     SmallPtrSet<Value *, 8> Seen;
@@ -877,11 +890,25 @@ private:
       Value *P = Worklist.pop_back_val();
       if (!Seen.insert(P).second)
         continue;
-      for (User *U : P->users()) {
-        if (auto *SI = dyn_cast<StoreInst>(U); SI && SI->getPointerOperand() == P)
-          return true;
-        if (isa<GetElementPtrInst, PHINode, SelectInst>(U))
-          Worklist.push_back(U);
+      for (Use &U : P->uses()) {
+        User *Usr = U.getUser();
+        if (isa<LoadInst, ICmpInst>(Usr))
+          continue;
+        if (isa<GetElementPtrInst, PHINode, SelectInst>(Usr)) {
+          Worklist.push_back(Usr);
+          continue;
+        }
+        if (auto *CB = dyn_cast<CallBase>(Usr)) {
+          if (CB->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(CB))
+            continue;
+          if (CB->isArgOperand(&U)) {
+            unsigned ArgNo = CB->getArgOperandNo(&U);
+            if ((CB->onlyReadsMemory(ArgNo) && CB->doesNotCapture(ArgNo)) ||
+                onlyReadsValueArray(*CB))
+              continue;
+          }
+        }
+        return true;
       }
     }
     return false;

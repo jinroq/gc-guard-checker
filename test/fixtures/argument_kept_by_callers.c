@@ -214,6 +214,43 @@ variadic_direct_caller(VALUE self)
     return bad_variadic_method_called_directly(1, args, self);
 }
 
+/* argv is passed to a function that may write to it. Reported. */
+void fill(VALUE *argv);
+
+static VALUE
+bad_method_argv_passed_to_writer(int argc, VALUE *argv, VALUE self)
+{
+    fill(argv);
+    const char *p = RSTRING_PTR(argv[0]);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+/* argv itself is stored to memory, through which anything may write to it.
+ * Reported. */
+VALUE *saved_argv;
+
+static VALUE
+bad_method_argv_stored(int argc, VALUE *argv, VALUE self)
+{
+    saved_argv = argv;
+    const char *p = RSTRING_PTR(argv[0]);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+/* rb_scan_args only reads argv. (Parenthesized to call the function rather
+ * than the macro.) Not reported. */
+static VALUE
+ok_method_argv_passed_to_rb_scan_args(int argc, VALUE *argv, VALUE self)
+{
+    VALUE str;
+    (rb_scan_args)(argc, argv, "1", &str);
+    const char *p = RSTRING_PTR(argv[0]);
+    rb_ary_new();
+    return INT2FIX(p[0] + (str != Qnil));
+}
+
 /* With argc == -2, the arguments are passed as an Array that the VM makes for
  * the call, which is not on the VM stack. Reported. */
 static VALUE
@@ -262,4 +299,7 @@ Init_argument_kept_by_callers(void)
     rb_define_method(c, "f", bad_variadic_method_called_directly, -1);
     rb_define_method(c, "g", bad_method_args_array, -2);
     rb_define_method(c, "h", ok_method_receiver_with_args_array, -2);
+    rb_define_method(c, "k", bad_method_argv_passed_to_writer, -1);
+    rb_define_method(c, "l", bad_method_argv_stored, -1);
+    rb_define_method(c, "m", ok_method_argv_passed_to_rb_scan_args, -1);
 }
