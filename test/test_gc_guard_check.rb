@@ -53,6 +53,11 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_equal(["bad_ptr_outside_loop"], reported_functions("gc_in_loop.c"))
   end
 
+  def test_use_in_next_iteration_is_of_new_value
+    assert_equal(["bad_callee_of_temporary_in_loop", "bad_value_defined_in_loop"],
+                 reported_functions("value_defined_in_loop.c"))
+  end
+
   def test_no_report_when_call_between_cannot_trigger_gc
     assert_equal([], reported_functions("non_gc_call_between.c"))
   end
@@ -136,6 +141,10 @@ class TestGCGuardCheck < Test::Unit::TestCase
   def test_value_loaded_from_escaped_slot
     assert_equal(["bad_loaded_then_slot_overwritten"],
                  reported_functions("loaded_from_escaped_slot.c"))
+  end
+
+  def test_value_stored_to_slot_only_on_some_paths
+    assert_equal(["bad_conditionally_stored_to_slot"], reported_functions("conditional_store_to_slot.c"))
   end
 
   def test_phi_with_constant_incoming_value

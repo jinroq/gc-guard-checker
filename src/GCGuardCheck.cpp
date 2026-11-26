@@ -6,6 +6,7 @@
 
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -59,7 +60,58 @@ public:
     return successorsReach(B).test(Index.lookup(B));
   }
 
+  // Like reachesAfter, but without executing the definition of X in between.
+  // When the definition is executed again in a loop, X is a new value, so
+  // what is reached that way is not about the value X had at From.
+  bool reachesAfterWithSameValue(const Value *X, const Instruction *From,
+                                 const Instruction *To) const {
+    if (!reachesAfter(From, To))
+      return false;
+    auto *Def = dyn_cast<Instruction>(X);
+    // A definition outside cycles is executed at most once
+    if (!Def || !inCycle(Def->getParent()))
+      return true;
+    const BasicBlock *FB = From->getParent(), *DB = Def->getParent(),
+                     *TB = To->getParent();
+    for (auto It = std::next(From->getIterator()); It != FB->end(); ++It) {
+      if (&*It == To)
+        return true;
+      if (&*It == Def)
+        return false;
+    }
+    if (!successorsReachAvoiding(FB, DB).test(Index.lookup(TB)))
+      return false;
+    // Entering the block of Def, only the instructions before Def are reached
+    return TB != DB || To->comesBefore(Def);
+  }
+
 private:
+  bool inCycle(const BasicBlock *BB) const {
+    return successorsReach(BB).test(Index.lookup(BB));
+  }
+
+  // The blocks entered from the successors of BB without going through
+  // Avoid (which is entered, but not left)
+  const BitVector &successorsReachAvoiding(const BasicBlock *BB,
+                                           const BasicBlock *Avoid) const {
+    auto Key = std::make_pair(BB, Avoid);
+    auto It = AvoidingCache.find(Key);
+    if (It != AvoidingCache.end())
+      return It->second;
+    BitVector Seen(Index.size());
+    SmallVector<const BasicBlock *, 32> Worklist(succ_begin(BB), succ_end(BB));
+    while (!Worklist.empty()) {
+      const BasicBlock *B = Worklist.pop_back_val();
+      unsigned I = Index.lookup(B);
+      if (Seen.test(I))
+        continue;
+      Seen.set(I);
+      if (B != Avoid)
+        Worklist.append(succ_begin(B), succ_end(B));
+    }
+    return AvoidingCache[Key] = std::move(Seen);
+  }
+
   // The blocks reachable from BB through one or more edges
   const BitVector &successorsReach(const BasicBlock *BB) const {
     auto It = Cache.find(BB);
@@ -80,6 +132,8 @@ private:
 
   DenseMap<const BasicBlock *, unsigned> Index;
   mutable DenseMap<const BasicBlock *, BitVector> Cache;
+  mutable DenseMap<std::pair<const BasicBlock *, const BasicBlock *>, BitVector>
+      AvoidingCache;
 };
 
 // Collects the pointers derived from v. Uses an insertion-ordered set so that
@@ -388,8 +442,10 @@ AllocaInst *resolveSlot(Value *Ptr, unsigned Depth = 0) {
 SmallVector<StoreInst *, 8> storesTo(AllocaInst *Slot);
 
 // Whether the slot may be overwritten with a value other than v between From
-// and C
-bool mayBeOverwrittenBetween(AllocaInst *Slot, Instruction *From,
+// and C. A store reached only through the definition of A again (in a loop)
+// is followed by a new A, so it does not count.
+bool mayBeOverwrittenBetween(AllocaInst *Slot, const Value *A,
+                             const Instruction *From,
                              const SmallPtrSet<Value *, 8> &Aliases,
                              Instruction *C, const Reachability &R) {
   for (StoreInst *SI : storesTo(Slot)) {
@@ -398,7 +454,8 @@ bool mayBeOverwrittenBetween(AllocaInst *Slot, Instruction *From,
     Value *W = SI->getValueOperand();
     if (Aliases.contains(W) || mergesWith(W, Aliases))
       continue;
-    if (R.reaches(From, SI) && R.reaches(SI, C))
+    if (R.reachesAfterWithSameValue(A, From, SI) &&
+        R.reachesAfterWithSameValue(A, SI, C))
       return true;
   }
   return false;
@@ -412,18 +469,7 @@ bool mayBeOverwrittenBefore(AllocaInst *Slot, Value *V,
   Instruction *Def = dyn_cast<Instruction>(V);
   if (!Def)
     Def = &*C->getFunction()->getEntryBlock().getFirstInsertionPt();
-  return mayBeOverwrittenBetween(Slot, Def, Aliases, C, R);
-}
-
-// Whether the lifetime of the slot may end between From and C
-bool lifetimeMayEndBetween(AllocaInst *Slot, Instruction *From,
-                           Instruction *C, const Reachability &R) {
-  for (User *U : Slot->users())
-    if (auto *II = dyn_cast<IntrinsicInst>(U);
-        II && II->getIntrinsicID() == Intrinsic::lifetime_end &&
-        R.reaches(From, II) && R.reaches(II, C))
-      return true;
-  return false;
+  return mayBeOverwrittenBetween(Slot, V, Def, Aliases, C, R);
 }
 
 // Collects the slot and the values pointing to it. RB_GC_GUARD(v) stores the
@@ -477,71 +523,175 @@ bool isEscaped(AllocaInst *Slot) {
   return false;
 }
 
-// Whether v is stored to the slot and stays there until C. For a slot whose
-// address has escaped, the compiler must assume that later calls may read it,
-// so it cannot remove or delay stores to it (nor volatile stores). Unless the
-// slot is overwritten or its lifetime ends afterwards, v is on the stack at C.
-// This is why RB_GC_GUARD(v) protects v wherever it is placed, as long as v is
-// not reassigned and the slot lives.
-bool isResidentInSlotAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
-                        Instruction *C, const Reachability &R) {
+// Whether v is in one of the stack slots holding it whenever C is executed
+// after v is defined. For a slot whose address has escaped, the compiler must
+// assume that later calls may read it, so it cannot remove or delay stores to
+// it (nor volatile stores). Unless the slot is overwritten or its lifetime
+// ends afterwards, v stored there is on the stack at C. This is why
+// RB_GC_GUARD(v) protects v wherever it is placed, as long as v is not
+// reassigned and the slot lives. A value loaded from such a slot is in it when
+// loaded (e.g. v after FilePathValue(v)).
+//
+// This follows the paths from the definition of v, tracking the slots that
+// hold v, and fails if C is reached with none. On a path where v is not
+// stored, the slot holds another value; v may be kept in different slots on
+// different paths (link and link_orig in realpath_rec of CRuby). A path that
+// executes the definition of v again ends there, since it then makes a new
+// value (in the next iteration of a loop).
+//
+// The paths are followed once for v, recording for each call reached whether
+// it may be reached with v in no slot.
+enum : uint8_t { CallReached = 1, CallReachedOutOfSlots = 2 };
+using SlotScan = DenseMap<const Instruction *, uint8_t>;
+
+SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
+  SlotScan Result;
+  SmallVector<AllocaInst *, 4> Slots;
+  auto IndexOf = [&](AllocaInst *Slot) {
+    auto It = find(Slots, Slot);
+    if (It != Slots.end())
+      return unsigned(It - Slots.begin());
+    Slots.push_back(Slot);
+    return unsigned(Slots.size() - 1);
+  };
+  auto HoldsAcrossCalls = [](StoreInst *SI, AllocaInst *Slot) {
+    return Slot && (SI->isVolatile() || isEscaped(Slot));
+  };
+  // What an instruction does to the slots holding v: puts v into a slot, takes
+  // it out, or copies the content of another slot (link_orig = link, which
+  // loads link from its slot)
+  enum class Kind { Put, Take, Copy };
+  struct Effect {
+    Kind K;
+    unsigned Slot;
+    unsigned From = 0;
+  };
+  DenseMap<const Instruction *, Effect> Effects;
   for (User *U : A->users()) {
     auto *SI = dyn_cast<StoreInst>(U);
     if (!SI || SI->getValueOperand() != A)
       continue;
     AllocaInst *Slot = resolveSlot(SI->getPointerOperand());
-    if (!Slot || !(SI->isVolatile() || isEscaped(Slot)))
-      continue;
-    if (R.reaches(SI, C) &&
-        !mayBeOverwrittenBetween(Slot, SI, Aliases, C, R) &&
-        !lifetimeMayEndBetween(Slot, SI, C, R))
-      return true;
+    if (HoldsAcrossCalls(SI, Slot))
+      Effects[SI] = {Kind::Put, IndexOf(Slot)};
   }
-  return false;
+  unsigned Initial = 0;
+  if (auto *LI = dyn_cast<LoadInst>(A))
+    if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand());
+        Slot && isEscaped(Slot))
+      Initial = 1u << IndexOf(Slot);
+  // Copies from the slots found so far, which may find more slots
+  for (unsigned I = 0; I < Slots.size() && Slots.size() <= 32; ++I)
+    for (User *U : Slots[I]->users()) {
+      auto *LI = dyn_cast<LoadInst>(U);
+      if (!LI || LI->getPointerOperand() != Slots[I])
+        continue;
+      for (User *LU : LI->users()) {
+        auto *SI = dyn_cast<StoreInst>(LU);
+        if (!SI || SI->getValueOperand() != LI || Effects.count(SI))
+          continue;
+        AllocaInst *Slot = resolveSlot(SI->getPointerOperand());
+        if (HoldsAcrossCalls(SI, Slot))
+          Effects[SI] = {Kind::Copy, IndexOf(Slot), I};
+      }
+    }
+  if (Slots.empty() || Slots.size() > 32)
+    return Result;
+  for (unsigned I = 0; I < Slots.size(); ++I) {
+    for (StoreInst *SI : storesTo(Slots[I])) {
+      Value *W = SI->getValueOperand();
+      if (Effects.count(SI) || Aliases.contains(W) || mergesWith(W, Aliases))
+        continue;
+      Effects[SI] = {Kind::Take, I};
+    }
+    for (User *U : Slots[I]->users())
+      if (auto *II = dyn_cast<IntrinsicInst>(U);
+          II && II->getIntrinsicID() == Intrinsic::lifetime_end)
+        Effects[II] = {Kind::Take, I};
+  }
+
+  auto *Def = dyn_cast<Instruction>(A);
+  SmallVector<std::pair<const BasicBlock *, unsigned>, 32> Worklist;
+  DenseSet<std::pair<const BasicBlock *, unsigned>> Seen;
+  // Scans BB from It with the slots holding v in State
+  auto Scan = [&](BasicBlock::const_iterator It, const BasicBlock *BB,
+                  unsigned State) {
+    for (; It != BB->end(); ++It) {
+      const Instruction *I = &*It;
+      if (I == Def)
+        return;
+      if (isa<CallBase>(I))
+        Result[I] |= State ? CallReached : CallReached | CallReachedOutOfSlots;
+      if (auto E = Effects.find(I); E != Effects.end()) {
+        const Effect &Eff = E->second;
+        unsigned Bit = 1u << Eff.Slot;
+        bool Holds = Eff.K == Kind::Put ||
+                     (Eff.K == Kind::Copy && (State & (1u << Eff.From)));
+        State = Holds ? (State | Bit) : (State & ~Bit);
+      }
+    }
+    for (const BasicBlock *Succ : successors(BB))
+      if (Seen.insert({Succ, State}).second)
+        Worklist.push_back({Succ, State});
+  };
+  const Function *F = Def ? Def->getFunction() : cast<Argument>(A)->getParent();
+  const BasicBlock *StartBB = Def ? Def->getParent() : &F->getEntryBlock();
+  Scan(Def ? std::next(Def->getIterator()) : StartBB->begin(), StartBB,
+       Initial);
+  while (!Worklist.empty()) {
+    auto [BB, State] = Worklist.pop_back_val();
+    Scan(BB->begin(), BB, State);
+  }
+  return Result;
 }
 
-// Whether v is loaded from a slot whose address has escaped and stays there
-// until C. The slot holds v when it is loaded, and still does at C unless it is
-// overwritten or its lifetime ends (e.g. a value reassigned with v = ... after
-// FilePathValue(v)).
-bool isLoadedFromResidentSlot(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
-                              Instruction *C, const Reachability &R) {
-  auto *LI = dyn_cast<LoadInst>(A);
-  if (!LI)
-    return false;
-  auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand());
-  return Slot && isEscaped(Slot) && R.reaches(LI, C) &&
-         !mayBeOverwrittenBetween(Slot, LI, Aliases, C, R) &&
-         !lifetimeMayEndBetween(Slot, LI, C, R);
-}
+// The results of scanSlots, for each value and the instruction its aliases
+// were collected for (which decides the aliases)
+class SlotScanCache {
+public:
+  bool isInSlotAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
+                  const Instruction &Base, const Instruction *C) {
+    auto Key = std::make_pair(static_cast<const Value *>(A), &Base);
+    auto It = Cache.find(Key);
+    if (It == Cache.end())
+      It = Cache.try_emplace(Key, scanSlots(A, Aliases)).first;
+    uint8_t Flags = It->second.lookup(C);
+    return (Flags & CallReached) && !(Flags & CallReachedOutOfSlots);
+  }
+
+private:
+  DenseMap<std::pair<const Value *, const Instruction *>, SlotScan> Cache;
+};
 
 // Whether v is in a stack slot at C. A phi is when all of its incoming values
 // are (whichever path it comes from, that path's value is in the slot), except
 // for constants, which are not objects in the heap.
 bool isResidentAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
-                  Instruction *C, const Reachability &R, unsigned Depth = 0) {
-  if (isResidentInSlotAt(A, Aliases, C, R) ||
-      isLoadedFromResidentSlot(A, Aliases, C, R))
+                  const Instruction &Base, Instruction *C,
+                  SlotScanCache &Slots, unsigned Depth = 0) {
+  if (Slots.isInSlotAt(A, Aliases, Base, C))
     return true;
   auto *PN = dyn_cast<PHINode>(A);
   if (!PN || Depth >= 4)
     return false;
   return all_of(PN->incoming_values(), [&](Value *In) {
     return In == PN || isa<Constant>(In) ||
-           isResidentAt(In, Aliases, C, R, Depth + 1);
+           isResidentAt(In, Aliases, Base, C, Slots, Depth + 1);
   });
 }
 
 // Whether there is an actual use of X reachable from C. A use at C itself
 // counts when IncludeC is set: the callee receives v and is expected to keep
-// it, as rb_str_resize(str, ...) does.
+// it, as rb_str_resize(str, ...) does. A use reached only through the
+// definition of X again (in the next iteration of a loop) is of a new value,
+// so it does not count.
 bool hasUseReachableFrom(Value *X, Instruction *C, const Reachability &R,
                          bool IncludeC) {
   for (User *U : X->users()) {
     auto *I = dyn_cast<Instruction>(U);
     if (!I || I->isLifetimeStartOrEnd())
       continue;
-    if (IncludeC ? R.reaches(C, I) : R.reachesAfter(C, I))
+    if ((IncludeC && I == C) || R.reachesAfterWithSameValue(X, C, I))
       return true;
   }
   return false;
@@ -581,6 +731,8 @@ public:
       return isArgumentKeptAlive(A);
     return isLoadedFromMethodArgv(V);
   }
+
+  SlotScanCache &slotScans() { return SlotScans; }
 
   const Reachability &reachabilityOf(Function &F) {
     auto &Slot = Reach[&F];
@@ -709,6 +861,7 @@ private:
   DenseMap<Argument *, bool> ArgCache;
   SmallPtrSet<Argument *, 8> InProgress;
   DenseMap<Function *, std::unique_ptr<Reachability>> Reach;
+  SlotScanCache SlotScans;
 };
 
 bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
@@ -718,7 +871,7 @@ bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
   for (Value *A : Aliases) {
     if (hasUseReachableFrom(A, C, R, IncludeC))
       return true;
-    if (isResidentAt(A, Aliases, C, R))
+    if (isResidentAt(A, Aliases, Base, C, CA.slotScans()))
       return true;
     for (AllocaInst *Slot : collectSlots(A)) {
       if (mayBeOverwrittenBefore(Slot, A, Aliases, C, R))
@@ -849,8 +1002,10 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
       for (CallBase *C : GCCalls) {
         if (!R.reaches(Base, C) || isLiveAt(V, C, DT, *Base, R, CA))
           continue;
+        // An access reached only through Base again (in the next iteration of
+        // a loop) is through a new pointer
         auto *Use = find_if(Accesses, [&](Instruction *U) {
-          return R.reaches(C, U);
+          return U == C || R.reachesAfterWithSameValue(Base, C, U);
         });
         if (Use != Accesses.end()) {
           report(F, V, *C, **Use);

@@ -34,12 +34,16 @@ reported when `tmp` is dead, since `rb_str_new` allocates before copying.
 `v` is considered live at C when
 
 - `v`, or a value with the same bits (casts, phis and selects merging `v`, a
-  value compared equal to `v` in the dominated region), is used after C,
-- `v` is in a stack slot whose address has escaped (as `RB_GC_GUARD(v)` does)
-  and the slot is neither overwritten nor ends its lifetime before C. Once the
-  address escapes, the compiler cannot remove or delay stores to the slot, so
-  `RB_GC_GUARD` anywhere in the function protects `v` as long as `v` is not
-  reassigned and the slot lives.
+  value compared equal to `v` in the dominated region), is used after C. In a
+  loop, a use in the next iteration after `v` is defined again is of a new
+  value, so it does not count,
+- on every path from the definition of `v` to C, `v` is in a stack slot whose
+  address has escaped (as `RB_GC_GUARD(v)` does): it is stored or copied
+  there, and the slot is neither overwritten nor ends its lifetime before C.
+  Once the address escapes, the compiler cannot remove or delay stores to the
+  slot, so `RB_GC_GUARD` anywhere in the function protects `v` as long as `v`
+  is not reassigned and the slot lives. `v` may be in different slots on
+  different paths (`link` and `link_orig` in `realpath_rec` of CRuby).
 - `v` is kept alive by the callers during the whole call of the function:
   - the receiver and the arguments of a method defined with
     `rb_define_method` and friends, which are on the VM stack during the call
