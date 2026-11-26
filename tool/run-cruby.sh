@@ -78,10 +78,12 @@ tab=$(printf '\t')
 } | xargs -d '\n' -P "$JOBS" -n 1 "$ROOT/tool/analyze-one.sh" ||
     echo "warning: some files could not be analyzed (see $OUT/*.err)" >&2
 
-# Collect reports, highest priority first
+# Collect reports, highest priority first. Written to a temporary name, since
+# reports.txt itself matches *.txt
 for origin in call loaded argument other; do
     cat "$OUT"/*.txt 2>/dev/null | grep "\[origin=$origin\]\$" | sort || true
-done >"$OUT/reports.txt"
+done >"$OUT/reports.tmp"
+mv "$OUT/reports.tmp" "$OUT/reports.txt"
 
 echo "$(wc -l <"$OUT/reports.txt") reports in $OUT/reports.txt" >&2
 for origin in call loaded argument other; do
