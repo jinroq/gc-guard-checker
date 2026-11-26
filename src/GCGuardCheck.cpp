@@ -824,12 +824,22 @@ private:
     return FU;
   }
 
+  // An argument passed around a cycle of calls is assumed not kept when it is
+  // reached again, which only makes more reports. A result that depends on
+  // this assumption for an argument further up is not cached, so that the
+  // result for each argument does not depend on the order of queries. A true
+  // result is cached anyway, since it holds without the assumption.
   bool isArgumentKeptAlive(Argument *A) {
     if (auto It = ArgCache.find(A); It != ArgCache.end())
       return It->second;
-    // Recursion: assume not kept, which only makes more reports
-    if (!InProgress.insert(A).second)
+    if (auto It = InProgress.find(A); It != InProgress.end()) {
+      MinAssumedDepth = std::min(MinAssumedDepth, It->second);
       return false;
+    }
+    unsigned Depth = InProgress.size();
+    InProgress[A] = Depth;
+    unsigned OuterMinAssumedDepth = MinAssumedDepth;
+    MinAssumedDepth = UINT_MAX;
     const FunctionUses &FU = usesOf(A->getParent());
     bool Kept = FU.Known &&
                 (!FU.definedAsMethod() ||
@@ -839,7 +849,10 @@ private:
              isKeptAcrossCall(CB->getArgOperand(A->getArgNo()), CB);
     });
     InProgress.erase(A);
-    return ArgCache[A] = Kept;
+    if (Kept || MinAssumedDepth >= Depth)
+      ArgCache[A] = Kept;
+    MinAssumedDepth = std::min(OuterMinAssumedDepth, MinAssumedDepth);
+    return Kept;
   }
 
   bool isKeptAcrossCall(Value *Arg, CallBase *CB) {
@@ -917,7 +930,10 @@ private:
   FunctionAnalysisManager &FAM;
   DenseMap<Function *, FunctionUses> Uses;
   DenseMap<Argument *, bool> ArgCache;
-  SmallPtrSet<Argument *, 8> InProgress;
+  // The arguments being computed, with their depths
+  DenseMap<Argument *, unsigned> InProgress;
+  // The least depth of the arguments assumed not kept in the computation
+  unsigned MinAssumedDepth = UINT_MAX;
   DenseMap<Function *, std::unique_ptr<Reachability>> Reach;
   SlotScanCache SlotScans;
 };
