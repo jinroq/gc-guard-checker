@@ -56,9 +56,11 @@ A call is considered not to trigger GC when it
 - only reads memory (from LLVM's memory attributes),
 - is a library function known to LLVM (`fstat`, `memcpy`, `malloc`, ...) and
   receives no function pointer (unlike `qsort`), or
-- is in a short list of CRuby functions whose implementations were checked not
-  to GC when they return (`rb_gc_writebarrier`, `rb_io_check_closed`, ...).
-  See `isKnownNonGCFunction` in `src/GCGuardCheck.cpp`.
+- is in a short list of functions whose implementations were checked not to GC
+  when they return: CRuby functions (`rb_gc_writebarrier`,
+  `rb_io_check_closed`, ...), system calls that LLVM does not know (`send`,
+  `recv`, ...) and zlib's checksums (`crc32`, `adler32`). See
+  `isKnownNonGCFunction` in `src/GCGuardCheck.cpp`.
 
 A `VALUE` that is only accessed as a non-Ruby struct (by its TBAA type) is
 skipped, since callbacks for `rb_rescue` and friends often receive a C pointer
@@ -139,8 +141,14 @@ Reports are candidates to be checked by reading the code, not confirmed bugs.
   or the frame of a caller in another file. Most reports with
   `origin=argument` and `origin=loaded` are of this kind.
 - Library functions that LLVM does not know, such as OpenSSL's, are treated as
-  possibly triggering GC.
-- Indirect calls are treated as possibly triggering GC.
+  possibly triggering GC unless listed. Being in a system library is not
+  enough: OpenSSL calls back into Ruby through callbacks registered earlier
+  (`SSL_CTX_set_verify`, ...), and zlib allocates through `xmalloc`.
+- Indirect calls are treated as possibly triggering GC. In CRuby they are
+  mostly callbacks (`rb_class_foreach_subclass`, the interface of random
+  number generators, ...), which may run any code.
+- Calls to functions defined in the same file are treated as possibly
+  triggering GC, without looking into their bodies.
 - It analyzes the IR from `clang -O2`, while CRuby is usually built with
   `-O3`, often with GCC. Register allocation and stack slot reuse are not
   modeled; a value that is dead in the IR may still happen to be in a register
