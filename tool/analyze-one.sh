@@ -27,5 +27,7 @@ if (cd "$dir" && "$LLVM_BIN/clang" -O2 -g -S -emit-llvm -w $flags "$src" -o "$ll
         echo "analysis failed: $src (see $OUT/$name.err)" >&2
     fi
 else
+    # Listed at the end by run-cruby.sh
+    echo "$src" >"$OUT/$name.uncompiled"
     echo "compile failed: $src (see $OUT/$name.err)" >&2
 fi

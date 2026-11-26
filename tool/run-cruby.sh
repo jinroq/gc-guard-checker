@@ -43,7 +43,7 @@ SRCDIR=$(make_var "$BUILD" srcdir)
 case $SRCDIR in /*) ;; *) SRCDIR=$BUILD/$SRCDIR ;; esac
 export LLVM_BIN PLUGIN OUT
 
-rm -f "$OUT"/*.txt "$OUT"/*.failed
+rm -f "$OUT"/*.txt "$OUT"/*.failed "$OUT"/*.uncompiled
 tab=$(printf '\t')
 
 # Jobs, one per line: NAME<TAB>DIR<TAB>SOURCE<TAB>FLAGS
@@ -76,7 +76,9 @@ tab=$(printf '\t')
         done
     fi
 } | xargs -d '\n' -P "$JOBS" -n 1 "$ROOT/tool/analyze-one.sh" ||
-    echo "warning: some files could not be analyzed (see $OUT/*.err)" >&2
+    # analyze-one.sh itself records failures to compile or analyze, so this
+    # is an unexpected failure of a worker
+    worker_failed=1
 
 # Collect reports, highest priority first. Written to a temporary name, since
 # reports.txt itself matches *.txt
@@ -90,11 +92,21 @@ for origin in call loaded argument other; do
     printf '  %-8s %s\n' "$origin" "$(grep -c "\[origin=$origin\]\$" "$OUT/reports.txt" || true)" >&2
 done
 
+uncompiled=$(cat "$OUT"/*.uncompiled 2>/dev/null || true)
+if [ -n "$uncompiled" ]; then
+    echo "warning: $(echo "$uncompiled" | wc -l) files could not be compiled:" >&2
+    echo "$uncompiled" | sed 's/^/  /' >&2
+fi
+
 # Unlike a file that cannot be compiled, a crash of the checker leaves the
 # reports of the file incomplete
 failed=$(cat "$OUT"/*.failed 2>/dev/null || true)
 if [ -n "$failed" ]; then
     echo "error: the analysis failed for $(echo "$failed" | wc -l) files, so the reports are incomplete:" >&2
     echo "$failed" | sed 's/^/  /' >&2
+    exit 1
+fi
+if [ -n "${worker_failed:-}" ]; then
+    echo "error: a worker failed unexpectedly, so the reports may be incomplete" >&2
     exit 1
 fi
