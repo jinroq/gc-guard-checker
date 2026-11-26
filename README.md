@@ -117,7 +117,8 @@ kept in `out/<file>.ll`.
 
 Set `WITH_EXT=0` to skip the extensions. A few files that need special compiler
 flags (the SIMD implementations of BLAKE3) cannot be compiled by the script;
-they do not use the Ruby API.
+they do not use the Ruby API. If the checker itself fails on a file, the
+reports are incomplete, so the script lists the file and exits with an error.
 
 ## Limitations
 

@@ -43,7 +43,7 @@ SRCDIR=$(make_var "$BUILD" srcdir)
 case $SRCDIR in /*) ;; *) SRCDIR=$BUILD/$SRCDIR ;; esac
 export LLVM_BIN PLUGIN OUT
 
-rm -f "$OUT"/*.txt
+rm -f "$OUT"/*.txt "$OUT"/*.failed
 tab=$(printf '\t')
 
 # Jobs, one per line: NAME<TAB>DIR<TAB>SOURCE<TAB>FLAGS
@@ -87,3 +87,12 @@ echo "$(wc -l <"$OUT/reports.txt") reports in $OUT/reports.txt" >&2
 for origin in call loaded argument other; do
     printf '  %-8s %s\n' "$origin" "$(grep -c "\[origin=$origin\]\$" "$OUT/reports.txt" || true)" >&2
 done
+
+# Unlike a file that cannot be compiled, a crash of the checker leaves the
+# reports of the file incomplete
+failed=$(cat "$OUT"/*.failed 2>/dev/null || true)
+if [ -n "$failed" ]; then
+    echo "error: the analysis failed for $(echo "$failed" | wc -l) files, so the reports are incomplete:" >&2
+    echo "$failed" | sed 's/^/  /' >&2
+    exit 1
+fi

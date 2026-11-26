@@ -19,8 +19,13 @@ ll=$OUT/$name.ll
 # -DRUBY_EXTCONF_H="extconf.h") are kept literally, as make passes them.
 # shellcheck disable=SC2086
 if (cd "$dir" && "$LLVM_BIN/clang" -O2 -g -S -emit-llvm -w $flags "$src" -o "$ll") 2>"$OUT/$name.err"; then
-    "$LLVM_BIN/opt" -load-pass-plugin="$PLUGIN" -passes=gc-guard-check \
-        -disable-output "$ll" >"$OUT/$name.txt" 2>>"$OUT/$name.err"
+    if ! "$LLVM_BIN/opt" -load-pass-plugin="$PLUGIN" -passes=gc-guard-check \
+        -disable-output "$ll" >"$OUT/$name.txt" 2>>"$OUT/$name.err"; then
+        # The reports of a file whose analysis failed are incomplete, so
+        # run-cruby.sh reports this as an error
+        echo "$src" >"$OUT/$name.failed"
+        echo "analysis failed: $src (see $OUT/$name.err)" >&2
+    fi
 else
     echo "compile failed: $src (see $OUT/$name.err)" >&2
 fi
