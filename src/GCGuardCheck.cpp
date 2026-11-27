@@ -234,8 +234,23 @@ bool isKnownNonGCFunction(StringRef Name) {
       // Only marks and records in the remembered set, allocating with plain
       // malloc (with the default GC)
       "rb_gc_writebarrier",
+      // Only greys the object or records it in the remembered set
+      "rb_gc_writebarrier_remember",
       // Only returns &errno
       "rb_errno_ptr",
+      // Only returns the current execution context
+      "rb_current_ec",
+      // Only look up an ID table or return the size of an st_table
+      // (rb_st_lookup is not here: it may call #hash and #eql? of the keys)
+      "rb_id_table_lookup",
+      "rb_st_table_size",
+      // Only call the C functions of the encoding, or compare bytes
+      "rb_enc_precise_mbclen",
+      "rb_enc_ascget",
+      "rb_memsearch",
+      "rb_memcicmp",
+      // Only looks up the name table of the regexp
+      "onig_name_to_group_numbers",
       // libc system call wrappers that LLVM does not know as library
       // functions (the __*_chk ones are used with _FORTIFY_SOURCE). They
       // never call back into Ruby; a signal handler of Ruby only records
