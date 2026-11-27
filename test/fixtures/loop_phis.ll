@@ -155,6 +155,29 @@ exit:
   ret i64 4
 }
 
+; The GC call receives "" in the first iteration, where v is in no slot, and
+; a pointer into v in the next one, which it may read after GC. Reported.
+declare void @take(ptr)
+
+define void @bad_gc_call_again_with_pointer(i64 %n) {
+entry:
+  %s = call i64 @rb_str_new_static(ptr @.str, i64 1)
+  %obj = inttoptr i64 %s to ptr
+  %ptr.field = getelementptr i8, ptr %obj, i64 24
+  br label %loop
+
+loop:
+  %p = phi ptr [ @.str, %entry ], [ %ptr.field, %loop ]
+  %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]
+  call void @take(ptr %p)
+  %i.next = add i64 %i, 1
+  %done = icmp slt i64 %i.next, %n
+  br i1 %done, label %loop, label %exit
+
+exit:
+  ret void
+}
+
 !0 = !{!1, !2, i64 0}
 !1 = !{!"RBasic", !2, i64 0, !2, i64 8}
 !2 = !{!"long", !3, i64 0}

@@ -1488,8 +1488,9 @@ private:
             Instruction *&Use) {
     for (; It != BB->end(); ++It) {
       const Instruction *I = &*It;
-      if (S.Exposed && I != C && AccessSet.count(I) &&
-          accessesThroughCarried(S, I)) {
+      // An exposed path reaching an access, including C itself again (in a
+      // loop), through a pointer derived from v
+      if (S.Exposed && AccessSet.count(I) && accessesThroughCarried(S, I)) {
         Use = const_cast<Instruction *>(I);
         return true;
       }

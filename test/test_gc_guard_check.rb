@@ -166,7 +166,8 @@ class TestGCGuardCheck < Test::Unit::TestCase
   end
 
   def test_phis_in_loops
-    assert_equal(["bad_phi_of_new_value"], reported_functions("loop_phis.ll"))
+    assert_equal(["bad_gc_call_again_with_pointer", "bad_phi_of_new_value"],
+                 reported_functions("loop_phis.ll"))
   end
 
   def test_value_stored_to_slot_only_on_some_paths
