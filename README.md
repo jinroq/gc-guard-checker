@@ -66,6 +66,14 @@ is not an object in the heap.
     ...), may have unknown callers, so their arguments are not considered
     kept.
 
+Finally, a report is kept only when all of this holds on one path: following
+the paths from the definition of `v`, tracking at once the slots holding `v`
+and the values that are `v` or derived from it, C is reached with `v` in no
+slot, and an access through a pointer derived from `v` follows. Otherwise
+the slots and the pointer could be considered on different paths: in
+`pack_pack` of CRuby, `v` is out of its slot at C only in a later iteration
+where the call receives `""` rather than a pointer into `v`.
+
 A call is considered not to trigger GC when it
 
 - only reads memory (from LLVM's memory attributes),
@@ -170,8 +178,6 @@ call to rb_yield`, ...) finds them quickly. The common false reports are:
 - The call does not trigger GC in practice, but is not known to the checker
   (`rb_st_lookup` on a table with ID keys, a callback of `rb_id_table_foreach`
   that does not allocate, debug dumps with `ruby_snprintf`, ...).
-- `v` is out of its slots on a path where the pointer used after the call is
-  not from `v` (see Limitations).
 
 To check a report, build CRuby with AddressSanitizer
 (`cflags="-fsanitize=address -fno-omit-frame-pointer" LDFLAGS=-fsanitize=address`)

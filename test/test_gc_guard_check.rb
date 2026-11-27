@@ -144,6 +144,11 @@ class TestGCGuardCheck < Test::Unit::TestCase
                  reported_functions("loaded_from_escaped_slot.c"))
   end
 
+  def test_slots_and_pointers_on_the_same_path
+    assert_equal(["bad_interior_pointer_in_escaped_slot", "bad_pointer_kept_after_slot_overwritten"],
+                 reported_functions("path_sensitive_slots.c"))
+  end
+
   def test_value_known_to_be_constant_at_gc_call
     assert_equal(["bad_value_not_constant_at_gc"], reported_functions("value_constant_at_gc.c"))
   end

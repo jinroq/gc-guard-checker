@@ -1323,6 +1323,235 @@ void report(Function &F, Value *V, CallBase &C, Instruction &Use) {
      << "]\n";
 }
 
+// Confirms a report on one path. The checks above look at the stack slots
+// holding v and at the pointers used after C separately, each on some path,
+// so they may be satisfied only on different paths: in pack_pack of CRuby, v
+// is out of its slot at C only in a later iteration where the call receives
+// "" rather than a pointer into v. This follows the paths from the definition
+// of v, tracking at once the slots holding v and the values that are v or
+// derived from it, and confirms the report if, on one path, C is reached
+// with v in no slot and an access through a pointer derived from v follows.
+// Each value is computed again on the path from what its operands are then;
+// the definition of v executed again makes v a new value, while a pointer
+// carried by a phi may still be derived from the previous one (prev = p).
+//
+// It is used only to drop reports, so it gives up (keeping the report) when
+// the state does not fit in its bits or the paths are too many.
+class PathConfirmation {
+public:
+  enum class Result { Confirmed, NotFound, GaveUp };
+
+  PathConfirmation(Value *V, const SmallPtrSet<Value *, 8> &Aliases,
+                   const SmallSetVector<Value *, 16> &Derived,
+                   const SmallVector<Instruction *, 8> &Accesses)
+      : V(V), Def(dyn_cast<Instruction>(V)),
+        AccessSet(Accesses.begin(), Accesses.end()) {
+    auto Track = [&](Value *X) {
+      if (isa<Instruction>(X) || X == V)
+        if (!TrackedIndex.count(X) && Tracked.size() < MaxTracked) {
+          TrackedIndex[X] = Tracked.size();
+          Tracked.push_back(X);
+        }
+    };
+    // Only the values with the same bits as v keep it alive in a slot: a
+    // pointer into v there (source_current in rb_str_casemap) does not
+    auto TrackSameBits = [&](Value *X) {
+      Track(X);
+      SameBits.insert(X);
+    };
+    TrackSameBits(V);
+    for (Value *X : Aliases)
+      TrackSameBits(X);
+    for (Value *X : Derived)
+      Track(X);
+    // The slots that may hold v: the slot v is loaded from, and those stored
+    // a tracked value, including a value loaded from such a slot
+    // (link_orig = link)
+    auto AddSlot = [&](AllocaInst *Slot) {
+      if (SlotIndex.count(Slot))
+        return;
+      if (Slots.size() >= MaxSlots) {
+        Overflow = true;
+        return;
+      }
+      SlotIndex[Slot] = Slots.size();
+      Slots.push_back(Slot);
+      for (User *SU : Slot->users())
+        if (auto *LI = dyn_cast<LoadInst>(SU);
+            LI && LI->getPointerOperand() == Slot)
+          TrackSameBits(LI);
+    };
+    if (auto *LI = dyn_cast<LoadInst>(V))
+      if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand());
+          Slot && isInMemory(Slot))
+        AddSlot(Slot);
+    for (unsigned I = 0; I < Tracked.size() && !Overflow; ++I) {
+      for (User *U : Tracked[I]->users()) {
+        auto *SI = dyn_cast<StoreInst>(U);
+        if (!SI || SI->getValueOperand() != Tracked[I] ||
+            !SameBits.count(Tracked[I]))
+          continue;
+        AllocaInst *Slot = resolveSlot(SI->getPointerOperand());
+        if (Slot && (SI->isVolatile() || isInMemory(Slot)))
+          AddSlot(Slot);
+      }
+    }
+    if (Overflow)
+      return;
+    if (Tracked.size() >= MaxTracked)
+      Overflow = true;
+    if (auto *LI = dyn_cast<LoadInst>(V))
+      if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand()))
+        if (auto It = SlotIndex.find(Slot); It != SlotIndex.end())
+          InitialSlots = uint64_t(1) << It->second;
+    for (AllocaInst *Slot : Slots)
+      for (StoreInst *SI : storesTo(Slot))
+        StoreSlot[SI] = SlotIndex[Slot];
+  }
+
+  Result confirm(Instruction *C, Instruction *&Use) {
+    if (Overflow)
+      return Result::GaveUp;
+    this->C = C;
+    Seen.clear();
+    Worklist.clear();
+    Steps = 0;
+    const BasicBlock *StartBB =
+        Def ? Def->getParent()
+            : &C->getFunction()->getEntryBlock();
+    State Start{InitialSlots, bit(V), false};
+    BasicBlock::const_iterator It =
+        Def ? std::next(Def->getIterator()) : StartBB->begin();
+    if (Def && isa<PHINode>(Def))
+      It = StartBB->getFirstNonPHIIt();
+    if (scan(StartBB, It, Start, Use))
+      return Result::Confirmed;
+    while (!Worklist.empty()) {
+      if (++Steps > MaxSteps)
+        return Result::GaveUp;
+      auto [BB, S] = Worklist.pop_back_val();
+      if (scan(BB, BB->getFirstNonPHIIt(), S, Use))
+        return Result::Confirmed;
+    }
+    return Result::NotFound;
+  }
+
+private:
+  static constexpr unsigned MaxSlots = 32, MaxTracked = 64,
+                            MaxSteps = 200000;
+
+  struct State {
+    uint64_t Slots;
+    uint64_t Carried;
+    bool Exposed;
+  };
+
+  uint64_t bit(const Value *X) const {
+    auto It = TrackedIndex.find(X);
+    return It == TrackedIndex.end() ? 0 : uint64_t(1) << It->second;
+  }
+  bool carried(const State &S, const Value *X) const {
+    return S.Carried & bit(X);
+  }
+
+  // Whether X, computed now from its operands in S, is derived from v
+  bool computesFromCarried(const State &S, const Instruction *X) const {
+    if (auto *LI = dyn_cast<LoadInst>(X)) {
+      if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand()))
+        if (auto It = SlotIndex.find(Slot); It != SlotIndex.end())
+          return S.Slots & (uint64_t(1) << It->second);
+      return carried(S, LI->getPointerOperand());
+    }
+    if (auto *CB = dyn_cast<CallBase>(X))
+      return returnsFirstArgument(*CB) && carried(S, CB->getArgOperand(0));
+    if (auto *SI = dyn_cast<SelectInst>(X))
+      return carried(S, SI->getTrueValue()) ||
+             carried(S, SI->getFalseValue());
+    return any_of(X->operands(), [&](const Use &Op) {
+      return carried(S, Op.get());
+    });
+  }
+
+  // Whether the access U goes through a pointer derived from v
+  bool accessesThroughCarried(const State &S, const Instruction *U) const {
+    if (auto *LI = dyn_cast<LoadInst>(U))
+      return carried(S, LI->getPointerOperand());
+    if (auto *SI = dyn_cast<StoreInst>(U))
+      return carried(S, SI->getPointerOperand());
+    if (auto *CB = dyn_cast<CallBase>(U))
+      return any_of(CB->args(), [&](const Use &A) { return carried(S, A.get()); });
+    return false;
+  }
+
+  // Scans BB from It in S. Returns true when the report is confirmed.
+  bool scan(const BasicBlock *BB, BasicBlock::const_iterator It, State S,
+            Instruction *&Use) {
+    for (; It != BB->end(); ++It) {
+      const Instruction *I = &*It;
+      if (S.Exposed && I != C && AccessSet.count(I) &&
+          accessesThroughCarried(S, I)) {
+        Use = const_cast<Instruction *>(I);
+        return true;
+      }
+      if (I == C && !S.Exposed && !S.Slots) {
+        S.Exposed = true;
+        if (AccessSet.count(I) && accessesThroughCarried(S, I)) {
+          Use = const_cast<Instruction *>(I);
+          return true;
+        }
+      }
+      if (auto *SI = dyn_cast<StoreInst>(I)) {
+        if (auto E = StoreSlot.find(SI); E != StoreSlot.end()) {
+          uint64_t SlotBit = uint64_t(1) << E->second;
+          const Value *W = SI->getValueOperand();
+          S.Slots = SameBits.count(W) && carried(S, W) ? (S.Slots | SlotBit)
+                                                       : (S.Slots & ~SlotBit);
+        }
+      }
+      else if (auto *II = dyn_cast<IntrinsicInst>(I);
+               II && II->getIntrinsicID() == Intrinsic::lifetime_end) {
+        if (auto *Slot = dyn_cast<AllocaInst>(II->getArgOperand(
+                II->arg_size() - 1)))
+          if (auto E = SlotIndex.find(Slot); E != SlotIndex.end())
+            S.Slots &= ~(uint64_t(1) << E->second);
+      }
+      if (uint64_t B = bit(I))
+        S.Carried = computesFromCarried(S, I) ? (S.Carried | B)
+                                              : (S.Carried & ~B);
+    }
+    for (const BasicBlock *Succ : successors(BB)) {
+      State Next = S;
+      // The phis of Succ take the incoming values from BB at once
+      uint64_t NewCarried = Next.Carried;
+      for (const PHINode &PN : Succ->phis())
+        if (uint64_t B = bit(&PN)) {
+          bool In = carried(S, PN.getIncomingValueForBlock(BB));
+          NewCarried = In ? (NewCarried | B) : (NewCarried & ~B);
+        }
+      Next.Carried = NewCarried;
+      if (Seen.insert({Succ, Next.Slots, Next.Carried, unsigned(Next.Exposed)}).second)
+        Worklist.push_back({Succ, Next});
+    }
+    return false;
+  }
+
+  Value *V;
+  Instruction *Def;
+  Instruction *C = nullptr;
+  SmallPtrSet<const Instruction *, 8> AccessSet;
+  SmallVector<Value *, 16> Tracked;
+  DenseMap<const Value *, unsigned> TrackedIndex;
+  SmallPtrSet<const Value *, 16> SameBits;
+  SmallVector<AllocaInst *, 4> Slots;
+  DenseMap<const AllocaInst *, unsigned> SlotIndex;
+  DenseMap<const StoreInst *, unsigned> StoreSlot;
+  uint64_t InitialSlots = 0;
+  bool Overflow = false;
+  unsigned Steps = 0;
+  SmallVector<std::pair<const BasicBlock *, State>, 32> Worklist;
+  DenseSet<std::tuple<const BasicBlock *, uint64_t, uint64_t, unsigned>> Seen;
+};
+
 // A module pass, since whether an argument is kept alive depends on the
 // callers in the module
 struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
@@ -1359,6 +1588,7 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
       auto Accesses = collectDerivedAccesses(Derived);
       if (!isUsedAsRubyObject(Accesses))
         continue;
+      std::optional<PathConfirmation> PC;
       for (CallBase *C : GCCalls) {
         if (!R.reaches(Base, C) || isConstantAt(V, *C, DT) ||
             isLiveAt(V, C, DT, *Base, R, CA))
@@ -1374,11 +1604,19 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
         auto *Use = find_if(Accesses, [&](Instruction *U) {
           return Carried.isAccessToValueAtC(U);
         });
-        if (Use != Accesses.end()) {
-          report(F, V, *C, **Use);
-          Reported.insert(V);
-          break;
-        }
+        if (Use == Accesses.end())
+          continue;
+        // Drop the report unless it holds on one path
+        if (!PC)
+          PC.emplace(V, collectValueAliases(V, &DT, Base), Derived, Accesses);
+        Instruction *PathUse = nullptr;
+        auto Res = PC->confirm(C, PathUse);
+        if (Res == PathConfirmation::Result::NotFound)
+          continue;
+        report(F, V, *C,
+               Res == PathConfirmation::Result::Confirmed ? *PathUse : **Use);
+        Reported.insert(V);
+        break;
       }
     }
   }
