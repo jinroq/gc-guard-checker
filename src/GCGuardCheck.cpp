@@ -512,9 +512,16 @@ SmallVector<StoreInst *, 8> storesTo(AllocaInst *Slot) {
 }
 
 // Whether the address of the slot escapes (is passed to an asm or a call, or
-// stored to memory). RB_GC_GUARD(v) passes it to an asm.
+// stored to memory). RB_GC_GUARD(v) passes it to an asm. The address may be
+// passed through GEPs, phis and selects (mem = tmpargs in rb_struct_new).
 bool isEscaped(AllocaInst *Slot) {
-  for (Value *H : collectHolders(Slot))
+  auto Holders = collectHolders(Slot);
+  SmallVector<Value *, 8> Worklist(Holders.begin(), Holders.end());
+  SmallPtrSet<Value *, 8> Seen;
+  while (!Worklist.empty()) {
+    Value *H = Worklist.pop_back_val();
+    if (!Seen.insert(H).second)
+      continue;
     for (User *U : H->users()) {
       if (auto *CB = dyn_cast<CallBase>(U);
           CB && CB->hasArgument(H) && !CB->isLifetimeStartOrEnd())
@@ -523,7 +530,11 @@ bool isEscaped(AllocaInst *Slot) {
           SI && SI->getValueOperand() == H &&
           !isa<AllocaInst>(SI->getPointerOperand()))
         return true;
+      if (isa<GetElementPtrInst, PHINode, SelectInst, BitCastInst,
+              AddrSpaceCastInst>(U))
+        Worklist.push_back(U);
     }
+  }
   return false;
 }
 

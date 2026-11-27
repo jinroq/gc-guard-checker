@@ -144,6 +144,10 @@ class TestGCGuardCheck < Test::Unit::TestCase
                  reported_functions("loaded_from_escaped_slot.c"))
   end
 
+  def test_slot_address_escaping_through_phi
+    assert_equal(["bad_slot_address_not_escaping"], reported_functions("slot_address_through_phi.c"))
+  end
+
   def test_value_in_slot_with_volatile_stores
     assert_equal(["bad_volatile_slot_overwritten"], reported_functions("string_value.c"))
   end
