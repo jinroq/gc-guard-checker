@@ -629,6 +629,41 @@ bool isInMemory(AllocaInst *Slot) {
   });
 }
 
+// The functions of CRuby that only read through their pointer arguments,
+// arrays of values (const VALUE *argv), unknown to LLVM where declared but not
+// defined. Not rb_scan_args, which stores to the pointers after the format.
+bool onlyReadsValueArrays(const Function *F) {
+  static const StringSet<> Names = {
+      // include/ruby
+      "rb_ary_aref", "rb_ary_cat", "rb_ary_new_from_values", "rb_block_call",
+      "rb_block_call_kw", "rb_call_super", "rb_call_super_kw",
+      "rb_check_funcall", "rb_check_funcall_kw", "rb_class_new_instance",
+      "rb_class_new_instance_kw", "rb_class_new_instance_pass_kw",
+      "rb_enumeratorize", "rb_enumeratorize_with_size",
+      "rb_enumeratorize_with_size_kw", "rb_enum_values_pack",
+      "rb_fiber_resume", "rb_fiber_resume_kw", "rb_fiber_transfer",
+      "rb_fiber_transfer_kw", "rb_fiber_yield", "rb_fiber_yield_kw",
+      "rb_f_sprintf", "rb_funcall_passing_block",
+      "rb_funcall_passing_block_kw", "rb_funcallv", "rb_funcallv_kw",
+      "rb_funcallv_public", "rb_funcallv_public_kw", "rb_funcall_with_block",
+      "rb_funcall_with_block_kw", "rb_get_values_at", "rb_hash_bulk_insert",
+      "rb_io_print", "rb_io_printf", "rb_io_puts", "rb_make_exception",
+      "rb_method_call", "rb_method_call_kw", "rb_method_call_with_block",
+      "rb_method_call_with_block_kw", "rb_obj_call_init",
+      "rb_obj_call_init_kw", "rb_proc_call_with_block",
+      "rb_proc_call_with_block_kw", "rb_str_format", "rb_yield_values2",
+      "rb_yield_values_kw",
+      // internal
+      "rb_ary_hash_values", "rb_ary_last", "rb_ary_tmp_new_from_values",
+      "rb_block_call2", "rb_check_block_call", "rb_check_funcall_basic_kw",
+      "rb_check_funcall_default", "rb_ec_ary_new_from_values",
+      "rb_funcallv_uncached", "rb_hash_bulk_insert_into_st_table",
+      "rb_hash_new_with_bulk_insert", "rb_reg_new_from_values",
+      "rb_str_concat_literals", "rb_str_format_ary", "rb_sym_proc_call",
+      "rb_vm_invoke_proc"};
+  return F && Names.contains(F->getName());
+}
+
 // The calls that may store to the slot: they receive its address, also
 // through GEPs, phis, selects and casts (as isEscaped follows it), as an
 // argument they do not only read (rb_string_value(&v) stores the converted
@@ -669,7 +704,8 @@ SmallVector<CallBase *, 4> callsWritingTo(AllocaInst *Slot) {
       if (!CB || !CB->isArgOperand(&U) || CB->isInlineAsm() ||
           CB->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(CB))
         continue;
-      if (CB->onlyReadsMemory(CB->getArgOperandNo(&U)))
+      if (CB->onlyReadsMemory(CB->getArgOperandNo(&U)) ||
+          onlyReadsValueArrays(CB->getCalledFunction()))
         continue;
       if (!is_contained(Calls, CB))
         Calls.push_back(CB);

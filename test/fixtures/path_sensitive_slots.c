@@ -297,3 +297,28 @@ bad_call_receiving_last_byte_of_value(void)
     rb_ary_new();
     return p[0];
 }
+
+/* rb_funcallv receives the address of the slot of s as argv, which it only
+ * reads (const VALUE *), so s stays in the slot. Not reported. */
+long
+ok_slot_address_to_function_reading_values(VALUE obj)
+{
+    VALUE s = rb_str_new_cstr("x");
+    const char *p = RSTRING_PTR(s);
+    rb_funcallv(obj, 1, 1, &s);
+    rb_ary_new();
+    return p[0];
+}
+
+/* rb_scan_args only reads argv, but stores to the pointers after the format,
+ * here the slot of s. The format is not a constant, so that it is called
+ * rather than expanded. Reported (boundary). */
+long
+bad_slot_address_to_scan_args(int argc, VALUE *argv, const char *fmt)
+{
+    VALUE s = rb_str_new_cstr("x");
+    const char *p = RSTRING_PTR(s);
+    rb_scan_args(argc, argv, fmt, &s);
+    rb_ary_new();
+    return p[0];
+}

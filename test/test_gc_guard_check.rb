@@ -148,7 +148,7 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_equal(["bad_call_receiving_last_byte_of_value", "bad_interior_pointer_in_escaped_slot",
                   "bad_origin_argument", "bad_origin_chain_over_limit",
                   "bad_origin_slot_overwritten_before_value", "bad_pointer_kept_after_slot_overwritten",
-                  "bad_slot_overwritten_by_call", "bad_slot_overwritten_through_select"],
+                  "bad_slot_address_to_scan_args", "bad_slot_overwritten_by_call", "bad_slot_overwritten_through_select"],
                  reported_functions("path_sensitive_slots.c"))
   end
 
