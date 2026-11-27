@@ -69,8 +69,9 @@ public:
     if (!reachesAfter(From, To))
       return false;
     auto *Def = dyn_cast<Instruction>(X);
-    // A definition outside cycles is executed at most once
-    if (!Def || !inCycle(Def->getParent()))
+    // A definition outside cycles is executed at most once, so not again if it
+    // cannot be executed after From (it may be for the first time)
+    if (!Def || (!inCycle(Def->getParent()) && !reachesAfter(From, Def)))
       return true;
     const BasicBlock *FB = From->getParent(), *DB = Def->getParent(),
                      *TB = To->getParent();
@@ -703,6 +704,92 @@ bool isResidentAt(Value *A, const Value *V,
   });
 }
 
+// Tells whether a value, observed at an instruction, may come from the value v
+// had at C. The values followed are v and those computed from it (the
+// pointers derived from it, or the values with the same bits). In a loop, they
+// may be computed again for the next iteration, but a phi may carry a value of
+// the previous iteration past that (prev = p, prev = cur, or a phi of itself).
+class CarriedValues {
+public:
+  CarriedValues(Value *V, Instruction *C,
+                std::function<bool(const Value *)> IsFollowed,
+                const Reachability &R)
+      : V(V), C(C), IsFollowed(std::move(IsFollowed)), R(R) {}
+
+  // Whether an operand of the access U may be derived from v at C
+  bool isAccessToValueAtC(Instruction *U) {
+    if (U == C)
+      return true;
+    return any_of(U->operands(),
+                  [&](Value *P) { return isFollowed(P) && isCarried(P, U); });
+  }
+
+  // Whether X at To may be (derived from) v at C
+  bool isCarried(Value *X, const Instruction *To) {
+    if (!isFollowed(X))
+      return false;
+    auto *I = dyn_cast<Instruction>(X);
+    if (!I)
+      return R.reachesAfter(C, To);
+    auto Key = std::make_pair(static_cast<const Value *>(X), To);
+    if (auto It = Memo.find(Key); It != Memo.end())
+      return It->second;
+    // Around a cycle of values (q = q + 1 in a loop), assume not carried. A
+    // result depending on this assumption for a query further up is not
+    // cached, as it may be wrong once that query is answered.
+    if (auto It = InProgress.find(Key); It != InProgress.end()) {
+      MinAssumedDepth = std::min(MinAssumedDepth, It->second);
+      return false;
+    }
+    unsigned Depth = InProgress.size();
+    InProgress[Key] = Depth;
+    unsigned OuterMinAssumedDepth = MinAssumedDepth;
+    MinAssumedDepth = UINT_MAX;
+    bool Result = computeIsCarried(I, To);
+    InProgress.erase(Key);
+    if (Result || MinAssumedDepth >= Depth)
+      Memo[Key] = Result;
+    MinAssumedDepth = std::min(OuterMinAssumedDepth, MinAssumedDepth);
+    return Result;
+  }
+
+private:
+  bool isFollowed(const Value *X) const { return X == V || IsFollowed(X); }
+
+  bool computeIsCarried(Instruction *X, const Instruction *To) {
+    // Not computed again after C: the value at C (for v itself, the value at C
+    // by definition; for others, computed from v)
+    if (R.reachesAfterWithSameValue(X, C, To))
+      return true;
+    // Computed again: from what the operands are at that point
+    if (!R.reaches(X, To))
+      return false;
+    if (auto *PN = dyn_cast<PHINode>(X)) {
+      for (unsigned I = 0; I < PN->getNumIncomingValues(); ++I) {
+        const Instruction *Term = PN->getIncomingBlock(I)->getTerminator();
+        if (R.reachesAfter(C, Term) && isCarried(PN->getIncomingValue(I), Term))
+          return true;
+      }
+      return false;
+    }
+    // v itself computed again is a new value
+    if (X == V)
+      return false;
+    return R.reachesAfter(C, X) &&
+           any_of(X->operands(), [&](Value *Q) { return isCarried(Q, X); });
+  }
+
+  Value *V;
+  Instruction *C;
+  std::function<bool(const Value *)> IsFollowed;
+  const Reachability &R;
+  DenseMap<std::pair<const Value *, const Instruction *>, bool> Memo;
+  // The queries being computed, with their depths, and the least depth of
+  // those assumed not carried in the current computation
+  DenseMap<std::pair<const Value *, const Instruction *>, unsigned> InProgress;
+  unsigned MinAssumedDepth = UINT_MAX;
+};
+
 // Whether there is an actual use of X reachable from C. A use at C itself
 // counts when IncludeC is set: the callee receives v and is expected to keep
 // it, as rb_str_resize(str, ...) does. A use reached only through the
@@ -715,6 +802,28 @@ bool hasUseReachableFrom(Value *X, Instruction *C, const Reachability &R,
     if (!I || I->isLifetimeStartOrEnd())
       continue;
     if ((IncludeC && I == C) || R.reachesAfterWithSameValue(X, C, I))
+      return true;
+  }
+  return false;
+}
+
+// Whether X, a value with the same bits as v, is used after C while it may
+// still be v at C (a use in the next iteration may be of v computed again, or
+// of v carried by a phi). A use by a phi happens at the end of the incoming
+// block. A use at C itself counts when IncludeC is set, as for
+// hasUseReachableFrom.
+bool hasUseOfValueAtC(Value *X, Instruction *C, CarriedValues &Carried,
+                      bool IncludeC) {
+  for (Use &U : X->uses()) {
+    auto *I = dyn_cast<Instruction>(U.getUser());
+    if (!I || I->isLifetimeStartOrEnd())
+      continue;
+    if (IncludeC && I == C)
+      return true;
+    const Instruction *At = I;
+    if (auto *PN = dyn_cast<PHINode>(I))
+      At = PN->getIncomingBlock(U)->getTerminator();
+    if (Carried.isCarried(X, At))
       return true;
   }
   return false;
@@ -970,8 +1079,10 @@ bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
               const Instruction &Base, const Reachability &R,
               CallerAnalysis &CA, bool IncludeC) {
   auto Aliases = collectValueAliases(V, &DT, &Base);
+  CarriedValues Carried(
+      V, C, [&](const Value *X) { return Aliases.contains(X); }, R);
   for (Value *A : Aliases) {
-    if (hasUseReachableFrom(A, C, R, IncludeC))
+    if (hasUseOfValueAtC(A, C, Carried, IncludeC))
       return true;
     if (isResidentAt(A, V, Aliases, Base, C, CA.slotScans()))
       return true;
@@ -1066,71 +1177,6 @@ void report(Function &F, Value *V, CallBase &C, Instruction &Use) {
      << "]\n";
 }
 
-// Tells whether the value of a pointer derived from v, observed at an access,
-// may come from the value v had at C. In a loop, v and the pointers may be
-// computed again for the next iteration, but a phi may carry a pointer of the
-// previous iteration (prev = p) past that.
-class CarriedValues {
-public:
-  CarriedValues(Value *V, Instruction *C,
-                const SmallSetVector<Value *, 16> &Derived,
-                const Reachability &R)
-      : V(V), C(C), Derived(Derived), R(R) {}
-
-  // Whether an operand of the access U may be derived from v at C
-  bool isAccessToValueAtC(Instruction *U) {
-    if (U == C)
-      return true;
-    return any_of(U->operands(), [&](Value *P) {
-      return Derived.contains(P) && isCarried(P, U);
-    });
-  }
-
-private:
-  // Whether X at To may be derived from v at C
-  bool isCarried(Value *X, const Instruction *To) {
-    if (X == V)
-      return R.reachesAfterWithSameValue(V, C, To);
-    if (!Derived.contains(X))
-      return false;
-    auto Key = std::make_pair(static_cast<const Value *>(X), To);
-    if (auto It = Memo.find(Key); It != Memo.end())
-      return It->second;
-    // Around a cycle of pointers (q = q + 1 in a loop), assume not carried
-    Memo[Key] = false;
-    bool Result = computeIsCarried(cast<Instruction>(X), To);
-    Memo[Key] = Result;
-    return Result;
-  }
-
-  bool computeIsCarried(Instruction *X, const Instruction *To) {
-    // Not computed again after C: the value at C
-    if (R.reachesAfterWithSameValue(X, C, To))
-      return true;
-    // Computed again: from what the operands are at that point
-    if (!R.reaches(X, To))
-      return false;
-    if (auto *PN = dyn_cast<PHINode>(X)) {
-      for (unsigned I = 0; I < PN->getNumIncomingValues(); ++I) {
-        const Instruction *Term = PN->getIncomingBlock(I)->getTerminator();
-        if (R.reachesAfter(C, Term) && isCarried(PN->getIncomingValue(I), Term))
-          return true;
-      }
-      return false;
-    }
-    return any_of(X->operands(), [&](Value *Q) {
-      return (Q == V || Derived.contains(Q)) && R.reachesAfter(C, X) &&
-             isCarried(Q, X);
-    });
-  }
-
-  Value *V;
-  Instruction *C;
-  const SmallSetVector<Value *, 16> &Derived;
-  const Reachability &R;
-  DenseMap<std::pair<const Value *, const Instruction *>, bool> Memo;
-};
-
 // A module pass, since whether an argument is kept alive depends on the
 // callers in the module
 struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
@@ -1172,7 +1218,12 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
           continue;
         // An access in the next iteration of a loop may be through a new
         // pointer, or one carried from this iteration
-        CarriedValues Carried(V, C, Derived, R);
+        CarriedValues Carried(
+            V, C,
+            [&](const Value *X) {
+              return Derived.contains(const_cast<Value *>(X));
+            },
+            R);
         auto *Use = find_if(Accesses, [&](Instruction *U) {
           return Carried.isAccessToValueAtC(U);
         });

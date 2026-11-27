@@ -144,6 +144,10 @@ class TestGCGuardCheck < Test::Unit::TestCase
                  reported_functions("loaded_from_escaped_slot.c"))
   end
 
+  def test_phis_in_loops
+    assert_equal(["bad_phi_of_new_value"], reported_functions("loop_phis.ll"))
+  end
+
   def test_value_stored_to_slot_only_on_some_paths
     assert_equal(["bad_conditionally_stored_to_slot", "bad_copied_before_stored"],
                  reported_functions("conditional_store_to_slot.c"))
@@ -169,15 +173,23 @@ class TestGCGuardCheck < Test::Unit::TestCase
     analyze(fixture).lines.filter_map { |l| l[REPORT_RE, 1] }.uniq.sort
   end
 
+  # A .c fixture is compiled with clang. A .ll fixture is LLVM IR written for
+  # shapes that clang does not reliably produce from C (the order of phis, ...).
   def analyze(fixture)
+    path = File.join(FIXTURES, fixture)
+    return run_pass(path) if fixture.end_with?(".ll")
+
     Dir.mktmpdir do |dir|
       ll = File.join(dir, "out.ll")
       run!(File.join(LLVM_BIN, "clang"), "-O2", "-g", "-S", "-emit-llvm", "-Wno-macro-redefined",
-           "-I#{RUBY_SRC}/include", "-I#{arch_include}",
-           File.join(FIXTURES, fixture), "-o", ll)
-      run!(File.join(LLVM_BIN, "opt"), "-load-pass-plugin=#{PLUGIN}",
-           "-passes=gc-guard-check", "-disable-output", ll)
+           "-I#{RUBY_SRC}/include", "-I#{arch_include}", path, "-o", ll)
+      run_pass(ll)
     end
+  end
+
+  def run_pass(ll)
+    run!(File.join(LLVM_BIN, "opt"), "-load-pass-plugin=#{PLUGIN}",
+         "-passes=gc-guard-check", "-disable-output", ll)
   end
 
   def arch_include
