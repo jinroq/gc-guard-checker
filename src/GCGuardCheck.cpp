@@ -24,6 +24,8 @@
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <functional>
+
 using namespace llvm;
 
 namespace {
