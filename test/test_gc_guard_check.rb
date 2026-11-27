@@ -145,9 +145,18 @@ class TestGCGuardCheck < Test::Unit::TestCase
   end
 
   def test_slots_and_pointers_on_the_same_path
-    assert_equal(["bad_interior_pointer_in_escaped_slot", "bad_pointer_kept_after_slot_overwritten",
+    assert_equal(["bad_interior_pointer_in_escaped_slot", "bad_origin_argument", "bad_origin_chain_over_limit",
+                  "bad_origin_slot_overwritten_before_value", "bad_pointer_kept_after_slot_overwritten",
                   "bad_slot_overwritten_by_call"],
                  reported_functions("path_sensitive_slots.c"))
+  end
+
+  def test_value_constant_expression
+    assert_equal(["bad_constant_expression_value"], reported_functions("constant_value.ll"))
+  end
+
+  def test_gc_call_before_value_defined
+    assert_equal([], reported_functions("call_before_value.ll"))
   end
 
   def test_path_confirmation_edges

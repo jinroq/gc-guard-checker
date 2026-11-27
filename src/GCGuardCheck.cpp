@@ -1365,14 +1365,35 @@ void report(Function &F, Value *V, CallBase &C, Instruction &Use) {
 class PathConfirmation {
 public:
   enum class Result { Confirmed, NotFound, GaveUp };
+  // The limit of v and the values it is made from as is
+  static constexpr unsigned MaxOrigins = 8;
 
   PathConfirmation(Value *V, const SmallPtrSet<Value *, 8> &Aliases,
                    const SmallSetVector<Value *, 16> &Derived,
                    const SmallVector<Instruction *, 8> &Accesses)
       : Def(dyn_cast<Instruction>(V)),
         AccessSet(Accesses.begin(), Accesses.end()) {
+    // v and the values it is made from as is (v = rb_io_taint_check(x)), the
+    // last of which, the origin, is where the paths start: these are v once
+    // v is defined
+    SmallVector<Value *, MaxOrigins> Chain;
+    for (Value *X = V;;) {
+      Chain.push_back(X);
+      auto *CB = dyn_cast<CallBase>(X);
+      if (!CB || !returnsFirstArgument(*CB))
+        break;
+      if (Chain.size() >= MaxOrigins) {
+        Overflow = true;
+        return;
+      }
+      X = CB->getArgOperand(0);
+    }
+    Origin = Chain.back();
+    // The instructions, and v and its origin even if not instructions (an
+    // argument, or a constant expression): another argument is not computed
+    // on the paths, so it would never be taken as v
     auto Track = [&](Value *X) {
-      if (isa<Instruction, Argument>(X))
+      if (isa<Instruction>(X) || is_contained(Chain, X))
         if (!TrackedIndex.count(X) && Tracked.size() < MaxTracked) {
           TrackedIndex[X] = Tracked.size();
           Tracked.push_back(X);
@@ -1406,20 +1427,12 @@ public:
             LI && LI->getPointerOperand() == Slot)
           TrackSameBits(LI);
     };
-    // v and the values it is made from as is (v = rb_io_taint_check(x)),
-    // which are defined before v and are v when it is defined
-    for (Value *X = V;;) {
+    for (Value *X : Chain)
       TrackSameBits(X);
-      PreAliases.push_back(X);
-      if (auto *LI = dyn_cast<LoadInst>(X))
-        if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand());
-            Slot && isInMemory(Slot))
-          AddSlot(Slot);
-      auto *CB = dyn_cast<CallBase>(X);
-      if (!CB || !returnsFirstArgument(*CB) || PreAliases.size() >= 8)
-        break;
-      X = CB->getArgOperand(0);
-    }
+    if (auto *LI = dyn_cast<LoadInst>(Origin))
+      if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand());
+          Slot && isInMemory(Slot))
+        AddSlot(Slot);
     for (unsigned I = 0; I < Tracked.size() && !Overflow; ++I) {
       for (User *U : Tracked[I]->users()) {
         auto *SI = dyn_cast<StoreInst>(U);
@@ -1435,13 +1448,12 @@ public:
       return;
     if (Tracked.size() >= MaxTracked)
       Overflow = true;
-    for (Value *X : PreAliases) {
-      InitialCarried |= bit(X);
-      if (auto *LI = dyn_cast<LoadInst>(X))
-        if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand()))
-          if (auto It = SlotIndex.find(Slot); It != SlotIndex.end())
-            InitialSlots |= uint64_t(1) << It->second;
-    }
+    // At the origin, only it is v, and the slot it is loaded from holds it
+    InitialCarried = bit(Origin);
+    if (auto *LI = dyn_cast<LoadInst>(Origin))
+      if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand()))
+        if (auto It = SlotIndex.find(Slot); It != SlotIndex.end())
+          InitialSlots = uint64_t(1) << It->second;
     for (AllocaInst *Slot : Slots) {
       for (StoreInst *SI : storesTo(Slot))
         StoreSlot[SI] = SlotIndex[Slot];
@@ -1457,13 +1469,15 @@ public:
     Seen.clear();
     Worklist.clear();
     Steps = 0;
+    auto *OriginDef = dyn_cast<Instruction>(Origin);
     const BasicBlock *StartBB =
-        Def ? Def->getParent()
-            : &C->getFunction()->getEntryBlock();
-    State Start{InitialSlots, InitialCarried, false};
+        OriginDef ? OriginDef->getParent()
+                  : &C->getFunction()->getEntryBlock();
+    // v is defined when the paths start at it
+    State Start{InitialSlots, InitialCarried, false, Origin == Def || !Def};
     BasicBlock::const_iterator It =
-        Def ? std::next(Def->getIterator()) : StartBB->begin();
-    if (Def && isa<PHINode>(Def))
+        OriginDef ? std::next(OriginDef->getIterator()) : StartBB->begin();
+    if (OriginDef && isa<PHINode>(OriginDef))
       It = StartBB->getFirstNonPHIIt();
     if (scan(StartBB, It, Start, Use))
       return Result::Confirmed;
@@ -1487,6 +1501,9 @@ private:
     uint64_t Slots;
     uint64_t Carried;
     bool Exposed;
+    // Whether v has been defined on the path: a call before it, between the
+    // origin and v, does not count
+    bool Defined;
   };
 
   uint64_t bit(const Value *X) const {
@@ -1537,7 +1554,7 @@ private:
         Use = const_cast<Instruction *>(I);
         return true;
       }
-      if (I == C && !S.Exposed && !S.Slots) {
+      if (I == C && !S.Exposed && S.Defined && !S.Slots) {
         S.Exposed = true;
         if (AccessSet.count(I) && accessesThroughCarried(S, I)) {
           Use = const_cast<Instruction *>(I);
@@ -1564,6 +1581,8 @@ private:
       if (uint64_t B = bit(I))
         S.Carried = computesFromCarried(S, I) ? (S.Carried | B)
                                               : (S.Carried & ~B);
+      if (I == Def)
+        S.Defined = true;
     }
     for (const BasicBlock *Succ : successors(BB)) {
       State Next = S;
@@ -1575,7 +1594,9 @@ private:
           NewCarried = In ? (NewCarried | B) : (NewCarried & ~B);
         }
       Next.Carried = NewCarried;
-      if (Seen.insert({Succ, Next.Slots, Next.Carried, unsigned(Next.Exposed)}).second)
+      if (Seen.insert({Succ, Next.Slots, Next.Carried,
+                       unsigned(Next.Exposed) | unsigned(Next.Defined) << 1})
+              .second)
         Worklist.push_back({Succ, Next});
     }
     return false;
@@ -1592,7 +1613,7 @@ private:
   DenseMap<const StoreInst *, unsigned> StoreSlot;
   DenseMap<const Instruction *, uint64_t> CallTakes;
   uint64_t InitialSlots = 0, InitialCarried = 0;
-  SmallVector<Value *, 8> PreAliases;
+  Value *Origin = nullptr;
   bool Overflow = false;
   unsigned Steps = 0, TotalSteps = 0;
   SmallVector<std::pair<const BasicBlock *, State>, 32> Worklist;

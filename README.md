@@ -233,7 +233,8 @@ False reports:
 - Beyond 32 stack slots or 32 copies between them for a value, the rest are
   not tracked, and `v` there does not count.
 - The confirmation on one path gives up, keeping the report, beyond 64 values
-  that are `v` or derived from it, 32 slots, 200000 blocks scanned for a call,
+  that are `v` or derived from it, 32 slots, 8 values `v` is made from as is
+  (`v = rb_io_taint_check(x)`, counting `v`), 200000 blocks scanned for a call,
   or 1000000 for all the calls of a `v`.
 
 Cost:

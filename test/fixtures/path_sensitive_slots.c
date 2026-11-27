@@ -122,3 +122,129 @@ ok_alias_defined_before_value(VALUE ary, VALUE res)
     }
     return res;
 }
+
+/* x is loaded from the slot of from, which is then overwritten before v is
+ * made from x as is. v is in no slot at the GC call. Reported. */
+long
+bad_origin_slot_overwritten_before_value(VALUE ary)
+{
+    VALUE from = RARRAY_AREF(ary, 0);
+    StringValue(from);
+    VALUE x = from;
+    from = Qnil;
+    VALUE v = rb_io_taint_check(x);
+    const char *p = RSTRING_PTR(v);
+    rb_ary_new();
+    return p[0] + RTEST(from);
+}
+
+/* x is copied to the escaped slot keep before v is made from it, and keep
+ * holds v at the GC call, while from is overwritten. The slots are
+ * overwritten (with nil) only on paths where the call receives "". Not
+ * reported. */
+void escape(VALUE *slot);
+
+VALUE
+ok_origin_copied_before_value(VALUE ary, VALUE res)
+{
+    VALUE from, keep = Qnil;
+    escape(&keep);
+    long n = RARRAY_LEN(ary);
+    for (long i = 0; i < n; i++) {
+        const char *ptr;
+        long len;
+        from = RARRAY_AREF(ary, i);
+        if (NIL_P(from)) {
+            keep = Qnil;
+            ptr = "";
+            len = 0;
+        }
+        else {
+            StringValue(from);
+            keep = from;
+            VALUE v = rb_io_taint_check(from);
+            from = Qnil;
+            ptr = RSTRING_PTR(v);
+            len = RSTRING_LEN(v);
+        }
+        rb_str_cat(res, ptr, len + RTEST(from));
+    }
+    return res;
+}
+
+/* v is made from from as is through 7 calls, so 8 values with v, the limit
+ * followed. As ok_alias_defined_before_value. Not reported. */
+VALUE
+ok_origin_chain_at_limit(VALUE ary, VALUE res)
+{
+    VALUE from;
+    long n = RARRAY_LEN(ary);
+    for (long i = 0; i < n; i++) {
+        const char *ptr;
+        long len;
+        from = RARRAY_AREF(ary, i);
+        if (NIL_P(from)) {
+            ptr = "";
+            len = 0;
+        }
+        else {
+            StringValue(from);
+            VALUE v = rb_io_taint_check(rb_io_taint_check(rb_io_taint_check(rb_io_taint_check(rb_io_taint_check(rb_io_taint_check(rb_io_taint_check(from)))))));
+            ptr = RSTRING_PTR(v);
+            len = RSTRING_LEN(v);
+        }
+        rb_str_cat(res, ptr, len);
+    }
+    return res;
+}
+
+/* The same through 8 calls, 9 values, over the limit, so the confirmation
+ * gives up and keeps the report, a false one here. Reported (boundary). */
+VALUE
+bad_origin_chain_over_limit(VALUE ary, VALUE res)
+{
+    VALUE from;
+    long n = RARRAY_LEN(ary);
+    for (long i = 0; i < n; i++) {
+        const char *ptr;
+        long len;
+        from = RARRAY_AREF(ary, i);
+        if (NIL_P(from)) {
+            ptr = "";
+            len = 0;
+        }
+        else {
+            StringValue(from);
+            VALUE v = rb_io_taint_check(rb_io_taint_check(rb_io_taint_check(rb_io_taint_check(rb_io_taint_check(rb_io_taint_check(rb_io_taint_check(rb_io_taint_check(from))))))));
+            ptr = RSTRING_PTR(v);
+            len = RSTRING_LEN(v);
+        }
+        rb_str_cat(res, ptr, len);
+    }
+    return res;
+}
+
+/* v is made from the argument arg as is, which no caller is known to keep.
+ * Reported. */
+long
+bad_origin_argument(VALUE arg)
+{
+    VALUE v = rb_io_taint_check(arg);
+    const char *p = RSTRING_PTR(v);
+    rb_ary_new();
+    return p[0];
+}
+
+/* arg is copied to the slot keep, escaped by RB_GC_GUARD, before v is made
+ * from it, and keep holds v at the GC call. Not reported. */
+long
+ok_origin_argument_kept_in_slot(VALUE arg)
+{
+    VALUE keep = arg;
+    VALUE v = rb_io_taint_check(arg);
+    const char *p = RSTRING_PTR(v);
+    rb_ary_new();
+    long r = p[0];
+    RB_GC_GUARD(keep);
+    return r;
+}
