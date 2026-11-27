@@ -140,6 +140,25 @@ reports are incomplete, so the script lists the file and exits with an error.
 ## Limitations
 
 Reports are candidates to be checked by reading the code, not confirmed bugs.
+When the analysis cannot tell, it errs on the side of reporting: a false
+report costs some reading, while a missed one leaves a bug. The known cases
+of each kind are listed below.
+
+It analyzes the IR from `clang -O2`, while CRuby is usually built with `-O3`,
+often with GCC. Register allocation and stack slot reuse are not modeled; a
+value that is dead in the IR may still happen to be in a register or a stale
+stack slot, which also makes these bugs hard to reproduce.
+
+Missed reports:
+
+- A call that receives `v` is assumed to keep it during the call, as
+  `rb_str_resize(str, ...)` does. If the callee is done with `v` before it
+  triggers GC, the report is missed.
+- The knowledge of CRuby functions (the functions that do not trigger GC, or
+  that only read `argv`) comes from reading their implementations, and
+  assumes the default GC.
+
+False reports:
 
 - Apart from the callers of methods and `static` functions above, it cannot
   tell that `v` is reachable from elsewhere: a global table, an object field,
@@ -154,11 +173,17 @@ Reports are candidates to be checked by reading the code, not confirmed bugs.
   number generators, ...), which may run any code.
 - Calls to functions defined in the same file are treated as possibly
   triggering GC, without looking into their bodies.
-- It analyzes the IR from `clang -O2`, while CRuby is usually built with
-  `-O3`, often with GCC. Register allocation and stack slot reuse are not
-  modeled; a value that is dead in the IR may still happen to be in a register
-  or a stale stack slot, which also makes these bugs hard to reproduce.
-- The knowledge of CRuby functions assumes the default GC.
+- A use of `v` by a phi at the edge from an `invoke` (or `callbr`) that may
+  trigger GC is not counted, as the use is taken to be at the end of the
+  block, which is the call itself. This does not happen in C.
+- Beyond 32 stack slots or 32 copies between them for a value, the rest are
+  not tracked, and `v` there does not count.
+
+Cost:
+
+- Following arguments around cycles of calls, and the paths through stack
+  slots, may take long for some shapes of code. On CRuby the whole run takes
+  about a minute.
 
 ## License
 
