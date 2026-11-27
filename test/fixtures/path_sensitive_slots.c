@@ -248,3 +248,52 @@ ok_origin_argument_kept_in_slot(VALUE arg)
     RB_GC_GUARD(keep);
     return r;
 }
+
+/* The address of the slot of s may reach the call through a select, so the
+ * call may store another value there. Reported. */
+long
+bad_slot_overwritten_through_select(int c)
+{
+    VALUE s = rb_str_new_cstr("x");
+    VALUE other = Qnil;
+    VALUE *slot = c ? &s : &other;
+    const char *p = RSTRING_PTR(s);
+    may_overwrite(slot);
+    rb_ary_new();
+    return p[0] + RTEST(other);
+}
+
+/* s is at the start of the struct h, whose address escapes (to an asm), and a
+ * call receives the address of another field. It cannot store over s, which
+ * stays in h. Not reported. */
+struct holder {
+    VALUE v;
+    char rest[16];
+};
+void fill(char *p);
+
+long
+ok_call_receiving_other_field(void)
+{
+    struct holder h;
+    h.v = rb_str_new_cstr("x");
+    __asm__ volatile("" : : "r"(&h) : "memory");
+    const char *p = RSTRING_PTR(h.v);
+    fill(h.rest);
+    rb_ary_new();
+    return p[0];
+}
+
+/* The same, but the call receives the address of the last byte of s, so it
+ * may store over s. Reported (boundary: the field after s is at 8). */
+long
+bad_call_receiving_last_byte_of_value(void)
+{
+    struct holder h;
+    h.v = rb_str_new_cstr("x");
+    __asm__ volatile("" : : "r"(&h) : "memory");
+    const char *p = RSTRING_PTR(h.v);
+    fill((char *)&h + sizeof(VALUE) - 1);
+    rb_ary_new();
+    return p[0];
+}

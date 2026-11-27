@@ -629,21 +629,52 @@ bool isInMemory(AllocaInst *Slot) {
   });
 }
 
-// The calls that may store to the slot: they receive its address, or a
-// pointer to it, as an argument they do not only read (rb_string_value(&v)
-// stores the converted value). The asm of RB_GC_GUARD only takes it.
+// The calls that may store to the slot: they receive its address, also
+// through GEPs, phis, selects and casts (as isEscaped follows it), as an
+// argument they do not only read (rb_string_value(&v) stores the converted
+// value). A value loaded from the slot is not its address, nor is the address
+// of another field of a struct whose first field holds v (a memset of its
+// padding). The asm of RB_GC_GUARD only takes it.
 SmallVector<CallBase *, 4> callsWritingTo(AllocaInst *Slot) {
+  const DataLayout &DL = Slot->getDataLayout();
+  // Whether the GEP may point into the VALUE at the start of the slot
+  auto MayPointToValue = [&](GetElementPtrInst *GEP) {
+    APInt Offset(DL.getIndexTypeSizeInBits(GEP->getType()), 0);
+    if (!GEP->accumulateConstantOffset(DL, Offset))
+      return true;
+    return Offset.sge(0) && Offset.slt(sizeof(uint64_t));
+  };
   SmallVector<CallBase *, 4> Calls;
+  SmallVector<Value *, 8> Worklist;
   for (Value *H : collectHolders(Slot))
+    if (resolveSlot(H) == Slot)
+      Worklist.push_back(H);
+  SmallPtrSet<Value *, 8> Seen;
+  while (!Worklist.empty()) {
+    Value *H = Worklist.pop_back_val();
+    if (!Seen.insert(H).second)
+      continue;
     for (Use &U : H->uses()) {
-      auto *CB = dyn_cast<CallBase>(U.getUser());
+      User *Usr = U.getUser();
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(Usr)) {
+        if (MayPointToValue(GEP))
+          Worklist.push_back(GEP);
+        continue;
+      }
+      if (isa<PHINode, SelectInst, BitCastInst, AddrSpaceCastInst>(Usr)) {
+        Worklist.push_back(Usr);
+        continue;
+      }
+      auto *CB = dyn_cast<CallBase>(Usr);
       if (!CB || !CB->isArgOperand(&U) || CB->isInlineAsm() ||
           CB->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(CB))
         continue;
       if (CB->onlyReadsMemory(CB->getArgOperandNo(&U)))
         continue;
-      Calls.push_back(CB);
+      if (!is_contained(Calls, CB))
+        Calls.push_back(CB);
     }
+  }
   return Calls;
 }
 
