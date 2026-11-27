@@ -548,23 +548,26 @@ using SlotScan = DenseMap<const Instruction *, uint8_t>;
 
 SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
   SlotScan Result;
+  // The state of a path has a bit for each slot, set while the slot holds v,
+  // and a bit for each load copying a slot (link_orig = link, which loads link
+  // from its slot and stores it), set if the loaded value is v. The content of
+  // the slot is taken when it is loaded, as the slot may change before the
+  // store. Beyond the limits, slots and copies are not tracked, so v there
+  // does not count, but the other slots still do.
+  constexpr unsigned MaxSlots = 32, MaxCopies = 32;
   SmallVector<AllocaInst *, 4> Slots;
-  auto IndexOf = [&](AllocaInst *Slot) {
+  auto IndexOf = [&](AllocaInst *Slot) -> std::optional<unsigned> {
     auto It = find(Slots, Slot);
     if (It != Slots.end())
       return unsigned(It - Slots.begin());
+    if (Slots.size() >= MaxSlots)
+      return std::nullopt;
     Slots.push_back(Slot);
     return unsigned(Slots.size() - 1);
   };
   auto HoldsAcrossCalls = [](StoreInst *SI, AllocaInst *Slot) {
     return Slot && (SI->isVolatile() || isEscaped(Slot));
   };
-  // The state of a path has a bit for each slot, set while the slot holds v,
-  // and a bit for each load copying a slot (link_orig = link, which loads link
-  // from its slot and stores it), set if the loaded value is v. The content of
-  // the slot is taken when it is loaded, as the slot may change before the
-  // store.
-  constexpr unsigned MaxSlots = 32, MaxCopies = 32;
   constexpr uint64_t SlotBits = (uint64_t(1) << MaxSlots) - 1;
   // What an instruction does to a bit: sets it, clears it, or copies another
   // bit to it
@@ -580,20 +583,25 @@ SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
     if (!SI || SI->getValueOperand() != A)
       continue;
     AllocaInst *Slot = resolveSlot(SI->getPointerOperand());
-    if (HoldsAcrossCalls(SI, Slot))
-      Effects[SI] = {Kind::Put, IndexOf(Slot)};
+    if (!HoldsAcrossCalls(SI, Slot))
+      continue;
+    if (auto Index = IndexOf(Slot))
+      Effects[SI] = {Kind::Put, *Index};
   }
   uint64_t Initial = 0;
   if (auto *LI = dyn_cast<LoadInst>(A))
     if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand());
         Slot && isEscaped(Slot))
-      Initial = uint64_t(1) << IndexOf(Slot);
+      if (auto Index = IndexOf(Slot))
+        Initial = uint64_t(1) << *Index;
   // Copies from the slots found so far, which may find more slots
   unsigned Copies = 0;
-  for (unsigned I = 0; I < Slots.size() && Slots.size() <= MaxSlots; ++I)
+  for (unsigned I = 0; I < Slots.size(); ++I)
     for (User *U : Slots[I]->users()) {
       auto *LI = dyn_cast<LoadInst>(U);
-      if (!LI || LI->getPointerOperand() != Slots[I])
+      // Beyond the limit, copies are not followed: their stores are taken as
+      // putting another value (below), as long as the destination is tracked
+      if (!LI || LI->getPointerOperand() != Slots[I] || Copies >= MaxCopies)
         continue;
       unsigned LoadBit = MaxSlots + Copies;
       bool Copied = false;
@@ -604,16 +612,17 @@ SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
         AllocaInst *Slot = resolveSlot(SI->getPointerOperand());
         if (!HoldsAcrossCalls(SI, Slot))
           continue;
-        Effects[SI] = {Kind::Copy, IndexOf(Slot), LoadBit};
-        Copied = true;
+        if (auto Index = IndexOf(Slot)) {
+          Effects[SI] = {Kind::Copy, *Index, LoadBit};
+          Copied = true;
+        }
       }
       if (Copied) {
-        if (++Copies > MaxCopies)
-          return Result;
+        ++Copies;
         Effects[LI] = {Kind::Copy, LoadBit, I};
       }
     }
-  if (Slots.empty() || Slots.size() > MaxSlots)
+  if (Slots.empty())
     return Result;
   for (unsigned I = 0; I < Slots.size(); ++I) {
     for (StoreInst *SI : storesTo(Slots[I])) {

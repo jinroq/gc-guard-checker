@@ -144,6 +144,10 @@ class TestGCGuardCheck < Test::Unit::TestCase
                  reported_functions("loaded_from_escaped_slot.c"))
   end
 
+  def test_many_copies_of_slot
+    assert_equal([], reported_functions("many_slot_copies.c"))
+  end
+
   def test_phis_in_loops
     assert_equal(["bad_phi_of_new_value"], reported_functions("loop_phis.ll"))
   end
