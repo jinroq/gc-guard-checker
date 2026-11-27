@@ -945,9 +945,11 @@ class CallerAnalysis {
 public:
   explicit CallerAnalysis(FunctionAnalysisManager &FAM) : FAM(FAM) {}
 
-  bool isKeptAlive(Value *V) {
+  bool isKeptAlive(Value *V, unsigned Depth = 0) {
     if (auto *A = dyn_cast<Argument>(V))
       return isArgumentKeptAlive(A);
+    if (auto *CB = dyn_cast<CallBase>(V))
+      return isReturnedFromKept(*CB, Depth);
     return isLoadedFromMethodArgv(V);
   }
 
@@ -1089,9 +1091,12 @@ private:
   // only by the VM and does not write to argv
   bool isLoadedFromMethodArgv(Value *V) {
     auto *LI = dyn_cast<LoadInst>(V);
-    if (!LI)
-      return false;
-    Value *P = LI->getPointerOperand();
+    return LI && pointsIntoMethodArgv(LI->getPointerOperand());
+  }
+
+  // Whether P points into argv of a method with argc == -1 that is called
+  // only by the VM and does not write to argv
+  bool pointsIntoMethodArgv(Value *P) {
     while (auto *GEP = dyn_cast<GEPOperator>(P))
       P = GEP->getPointerOperand();
     auto *Argv = dyn_cast<Argument>(P);
@@ -1100,6 +1105,59 @@ private:
     const FunctionUses &FU = usesOf(Argv->getParent());
     return FU.Known && FU.Calls.empty() && FU.isArgvOnVMStack() &&
            !isWrittenThrough(Argv);
+  }
+
+  // What a function returns, when it is always the same argument, or a value
+  // read through the same argument, which it only reads (as string_options
+  // in the prism extension returns argv[0])
+  struct ReturnedSource {
+    unsigned ArgNo;
+    bool ThroughPointer;
+  };
+
+  std::optional<ReturnedSource> returnedSource(Function &F) {
+    auto [It, Inserted] = Returned.try_emplace(&F);
+    if (!Inserted)
+      return It->second;
+    std::optional<ReturnedSource> Result;
+    for (BasicBlock &BB : F) {
+      auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+      if (!RI)
+        continue;
+      Value *RV = RI->getReturnValue();
+      std::optional<ReturnedSource> S;
+      if (auto *A = dyn_cast_or_null<Argument>(RV)) {
+        S = ReturnedSource{A->getArgNo(), false};
+      }
+      else if (auto *LI = dyn_cast_or_null<LoadInst>(RV)) {
+        Value *P = LI->getPointerOperand();
+        while (auto *GEP = dyn_cast<GEPOperator>(P))
+          P = GEP->getPointerOperand();
+        if (auto *A = dyn_cast<Argument>(P); A && A->onlyReadsMemory())
+          S = ReturnedSource{A->getArgNo(), true};
+      }
+      if (!S || (Result && (S->ArgNo != Result->ArgNo ||
+                            S->ThroughPointer != Result->ThroughPointer)))
+        return Returned[&F] = std::nullopt;
+      Result = S;
+    }
+    return Returned[&F] = Result;
+  }
+
+  // Whether the value returned by a call of a function defined here is kept
+  // alive: the argument it returns is, or the pointer it reads through
+  // points into argv of a method on the VM stack
+  bool isReturnedFromKept(CallBase &CB, unsigned Depth) {
+    Function *F = CB.getCalledFunction();
+    if (!F || F->isDeclaration() || Depth >= 4)
+      return false;
+    auto Src = returnedSource(*F);
+    if (!Src || CB.arg_size() <= Src->ArgNo)
+      return false;
+    Value *Arg = CB.getArgOperand(Src->ArgNo);
+    if (Src->ThroughPointer)
+      return pointsIntoMethodArgv(Arg);
+    return isa<Constant>(Arg) || isKeptAlive(Arg, Depth + 1);
   }
 
   // Whether the argument is an array of VALUEs that the function was checked
@@ -1153,6 +1211,7 @@ private:
 
   FunctionAnalysisManager &FAM;
   DenseMap<Function *, FunctionUses> Uses;
+  DenseMap<Function *, std::optional<ReturnedSource>> Returned;
   DenseMap<Argument *, bool> ArgCache;
   // The arguments being computed, with their depths
   DenseMap<Argument *, unsigned> InProgress;

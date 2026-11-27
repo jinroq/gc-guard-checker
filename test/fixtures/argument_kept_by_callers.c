@@ -292,6 +292,39 @@ bad_method_with_unknown_argc(VALUE self, VALUE str)
     return INT2FIX(p[0]);
 }
 
+/* As string_options in the prism extension: a static function that returns
+ * a value read through argv, which it only reads. */
+static NOINLINE VALUE
+first_argument(int argc, const VALUE *argv)
+{
+    if (argc < 1)
+        rb_raise(rb_eArgError, "no argument");
+    return argv[0];
+}
+
+/* The value returned by first_argument is argv[0] of this method, which is
+ * on the VM stack. Not reported. */
+static VALUE
+ok_method_value_returned_from_argv(int argc, VALUE *argv, VALUE self)
+{
+    VALUE str = first_argument(argc, argv);
+    const char *p = RSTRING_PTR(str);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
+/* The same function given an array of new strings, which is not on the VM
+ * stack. Reported (boundary). */
+VALUE
+bad_value_returned_from_new_array(void)
+{
+    VALUE args[1] = {rb_str_new_cstr("x")};
+    VALUE str = first_argument(1, args);
+    const char *p = RSTRING_PTR(str);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
 void
 define_with_argc(VALUE c, int argc)
 {
@@ -314,4 +347,5 @@ Init_argument_kept_by_callers(void)
     rb_define_method(c, "l", bad_method_argv_stored, -1);
     rb_define_method(c, "m", ok_method_argv_passed_to_rb_scan_args, -1);
     rb_define_method(c, "n", bad_method_argv_as_output_of_rb_scan_args, -1);
+    rb_define_method(c, "o", ok_method_value_returned_from_argv, -1);
 }

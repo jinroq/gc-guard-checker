@@ -179,7 +179,8 @@ class TestGCGuardCheck < Test::Unit::TestCase
                   "bad_method_argv_as_output_of_rb_scan_args", "bad_method_argv_passed_to_writer",
                   "bad_method_argv_stored", "bad_method_called_with_temporary",
                   "bad_method_with_unknown_argc", "bad_method_writing_argv",
-                  "bad_second_argument_not_kept", "bad_variadic_method_called_directly"],
+                  "bad_second_argument_not_kept", "bad_value_returned_from_new_array",
+                  "bad_variadic_method_called_directly"],
                  reported_functions("argument_kept_by_callers.c"))
   end
 

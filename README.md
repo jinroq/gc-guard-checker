@@ -56,7 +56,12 @@ is not an object in the heap.
     `argv` or is also called directly; with `argc == -2`, only the receiver,
     as the arguments are in an `Array` made for the call), or
   - an argument of a `static` function, when every caller keeps the passed
-    value alive across the call in the same way. Functions with external
+    value alive across the call in the same way.
+  - the value returned by a function defined in the same file that always
+    returns one of its arguments (when that is kept alive), or a value read
+    through an argument that it only reads (when that points into `argv` of
+    such a method), as `string_options` in the prism extension returns
+    `argv[0]`. Functions with external
     linkage, or whose address is used otherwise (as a callback, in a table,
     ...), may have unknown callers, so their arguments are not considered
     kept.
