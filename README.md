@@ -31,6 +31,10 @@ and `v` is not live at C. An access is a load or store through the pointer, or
 a call that receives the pointer: `rb_str_new(RSTRING_PTR(tmp), len)` is
 reported when `tmp` is dead, since `rb_str_new` allocates before copying.
 
+A call C is not checked where `v` is known to be a constant (Qnil, Qfalse,
+...), as dominated by the edge on which `v` compares equal to it: a constant
+is not an object in the heap.
+
 `v` is considered live at C when
 
 - `v`, or a value with the same bits (casts, phis and selects merging `v`, a

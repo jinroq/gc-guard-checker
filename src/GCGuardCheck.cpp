@@ -329,6 +329,32 @@ Value *equalOperandDominating(ICmpInst &Cmp, Value *A, const DominatorTree &DT,
   return nullptr;
 }
 
+// Whether V is known to be a constant (Qnil, Qfalse, ...) at C: C is
+// dominated by the edge on which icmp eq V and the constant holds. A constant
+// is not an object in the heap, so V need not be kept there (if (!result)
+// result = rb_str_new(...) in rb_file_expand_path_internal).
+bool isConstantAt(Value *V, const Instruction &C, const DominatorTree &DT) {
+  for (User *U : V->users()) {
+    auto *Cmp = dyn_cast<ICmpInst>(U);
+    if (!Cmp || !Cmp->isEquality())
+      continue;
+    Value *W = Cmp->getOperand(0) == V ? Cmp->getOperand(1) : Cmp->getOperand(0);
+    if (!isa<Constant>(W))
+      continue;
+    for (User *CU : Cmp->users()) {
+      auto *Br = dyn_cast<BranchInst>(CU);
+      if (!Br || !Br->isConditional())
+        continue;
+      BasicBlock *EqualSucc =
+          Br->getSuccessor(Cmp->getPredicate() == CmpInst::ICMP_EQ ? 0 : 1);
+      if (DT.dominates(BasicBlockEdge(Br->getParent(), EqualSucc),
+                       C.getParent()))
+        return true;
+    }
+  }
+  return false;
+}
+
 // Collects the values that may have the same bits as v (v itself,
 // inttoptr(v), its casts, GEPs with zero offset, and phis/selects merging v).
 // If any of them is in a register or on the stack, the conservative GC marks
@@ -1260,7 +1286,8 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
       if (!isUsedAsRubyObject(Accesses))
         continue;
       for (CallBase *C : GCCalls) {
-        if (!R.reaches(Base, C) || isLiveAt(V, C, DT, *Base, R, CA))
+        if (!R.reaches(Base, C) || isConstantAt(V, *C, DT) ||
+            isLiveAt(V, C, DT, *Base, R, CA))
           continue;
         // An access in the next iteration of a loop may be through a new
         // pointer, or one carried from this iteration
