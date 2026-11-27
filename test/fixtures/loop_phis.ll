@@ -253,6 +253,32 @@ exit:
   ret void
 }
 
+; As bad_origin_computed_again_before_call, with x a phi of the loop, taking
+; the next string of strs at the end of the previous iteration. x at the call
+; is already the next one, not the v whose pointer the call receives. Reported.
+define void @bad_origin_phi_computed_again_before_call(ptr %strs, i64 %n) {
+entry:
+  %x0 = call i64 @rb_str_new_static(ptr @.str, i64 1)
+  br label %loop
+
+loop:
+  %x = phi i64 [ %x0, %entry ], [ %x.next, %loop ]
+  %p = phi ptr [ @.str, %entry ], [ %ptr.field, %loop ]
+  %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]
+  call void @take(ptr %p)
+  %v = call i64 @rb_io_taint_check(i64 %x)
+  %obj = inttoptr i64 %v to ptr
+  %ptr.field = getelementptr i8, ptr %obj, i64 24
+  %x.slot = getelementptr i64, ptr %strs, i64 %i
+  %x.next = load i64, ptr %x.slot
+  %i.next = add i64 %i, 1
+  %done = icmp slt i64 %i.next, %n
+  br i1 %done, label %loop, label %exit
+
+exit:
+  ret void
+}
+
 !0 = !{!1, !2, i64 0}
 !1 = !{!"RBasic", !2, i64 0, !2, i64 8}
 !2 = !{!"long", !3, i64 0}

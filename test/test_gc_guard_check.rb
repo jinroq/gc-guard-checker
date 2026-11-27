@@ -182,7 +182,8 @@ class TestGCGuardCheck < Test::Unit::TestCase
 
   def test_phis_in_loops
     assert_equal(["bad_gc_call_again_with_pointer", "bad_origin_computed_again_before_call",
-                  "bad_phi_of_new_value", "bad_value_made_from_origin_after_call"],
+                  "bad_origin_phi_computed_again_before_call", "bad_phi_of_new_value",
+                  "bad_value_made_from_origin_after_call"],
                  reported_functions("loop_phis.ll"))
   end
 

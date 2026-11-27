@@ -416,7 +416,9 @@ SmallPtrSet<Value *, 8> collectValueAliases(Value *V,
 // (v = rb_io_taint_check(x)), and those made from them as is without v. They
 // are v at C only if C is reached from v without computing them again: in a
 // loop, x computed again before C is a new value, not the v of the previous
-// iteration.
+// iteration. A phi of x is computed again on entering its block; if it takes
+// the v of the previous iteration (x = phi [v, ...]), it is still v there,
+// but is taken as a new value, which may only keep a false report.
 SmallPtrSet<Value *, 8> collectOrigins(Value *V, const DominatorTree &DT) {
   SmallPtrSet<Value *, 8> Origins;
   auto *Def = dyn_cast<Instruction>(V);
@@ -429,8 +431,7 @@ SmallPtrSet<Value *, 8> collectOrigins(Value *V, const DominatorTree &DT) {
   while (!Worklist.empty()) {
     Value *A = Worklist.pop_back_val();
     auto *I = dyn_cast<Instruction>(A);
-    if (!I || I == Def || isa<PHINode>(I) || DT.dominates(Def, I) ||
-        !Origins.insert(A).second)
+    if (!I || I == Def || DT.dominates(Def, I) || !Origins.insert(A).second)
       continue;
     for (User *U : A->users())
       if (isa<IntToPtrInst, PtrToIntInst, BitCastInst, AddrSpaceCastInst>(U))
