@@ -178,6 +178,8 @@ call to rb_yield`, ...) finds them quickly. The common false reports are:
 - The call does not trigger GC in practice, but is not known to the checker
   (`rb_st_lookup` on a table with ID keys, a callback of `rb_id_table_foreach`
   that does not allocate, debug dumps with `ruby_snprintf`, ...).
+- `v` is out of its slots on a path where the pointer used after the call is
+  not from `v`, when the confirmation on one path gives up (see Limitations).
 
 To check a report, build CRuby with AddressSanitizer
 (`cflags="-fsanitize=address -fno-omit-frame-pointer" LDFLAGS=-fsanitize=address`)
@@ -230,6 +232,9 @@ False reports:
   block, which is the call itself. This does not happen in C.
 - Beyond 32 stack slots or 32 copies between them for a value, the rest are
   not tracked, and `v` there does not count.
+- The confirmation on one path gives up, keeping the report, beyond 64 values
+  that are `v` or derived from it, 32 slots, 200000 blocks scanned for a call,
+  or 1000000 for all the calls of a `v`.
 
 Cost:
 

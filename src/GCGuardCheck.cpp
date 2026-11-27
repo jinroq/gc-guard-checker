@@ -1455,7 +1455,7 @@ public:
     if (scan(StartBB, It, Start, Use))
       return Result::Confirmed;
     while (!Worklist.empty()) {
-      if (++Steps > MaxSteps)
+      if (++Steps > MaxSteps || ++TotalSteps > MaxTotalSteps)
         return Result::GaveUp;
       auto [BB, S] = Worklist.pop_back_val();
       if (scan(BB, BB->getFirstNonPHIIt(), S, Use))
@@ -1465,8 +1465,10 @@ public:
   }
 
 private:
+  // The limits of the slots and the values tracked, and of the blocks
+  // scanned for one call and for all the calls of one v
   static constexpr unsigned MaxSlots = 32, MaxTracked = 64,
-                            MaxSteps = 200000;
+                            MaxSteps = 200000, MaxTotalSteps = 1000000;
 
   struct State {
     uint64_t Slots;
@@ -1579,7 +1581,7 @@ private:
   DenseMap<const Instruction *, uint64_t> CallTakes;
   uint64_t InitialSlots = 0;
   bool Overflow = false;
-  unsigned Steps = 0;
+  unsigned Steps = 0, TotalSteps = 0;
   SmallVector<std::pair<const BasicBlock *, State>, 32> Worklist;
   DenseSet<std::tuple<const BasicBlock *, uint64_t, uint64_t, unsigned>> Seen;
 };
