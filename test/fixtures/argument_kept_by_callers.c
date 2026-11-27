@@ -251,6 +251,17 @@ ok_method_argv_passed_to_rb_scan_args(int argc, VALUE *argv, VALUE self)
     return INT2FIX(p[0] + (str != Qnil));
 }
 
+/* rb_scan_args only reads the argv argument, but writes to the pointers
+ * after the format, here into argv. Reported. */
+static VALUE
+bad_method_argv_as_output_of_rb_scan_args(int argc, VALUE *argv, VALUE self)
+{
+    (rb_scan_args)(argc, argv, "1", &argv[0]);
+    const char *p = RSTRING_PTR(argv[0]);
+    rb_ary_new();
+    return INT2FIX(p[0]);
+}
+
 /* With argc == -2, the arguments are passed as an Array that the VM makes for
  * the call, which is not on the VM stack. Reported. */
 static VALUE
@@ -302,4 +313,5 @@ Init_argument_kept_by_callers(void)
     rb_define_method(c, "k", bad_method_argv_passed_to_writer, -1);
     rb_define_method(c, "l", bad_method_argv_stored, -1);
     rb_define_method(c, "m", ok_method_argv_passed_to_rb_scan_args, -1);
+    rb_define_method(c, "n", bad_method_argv_as_output_of_rb_scan_args, -1);
 }

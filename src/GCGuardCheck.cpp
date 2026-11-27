@@ -10,6 +10,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/CFG.h"
@@ -905,14 +906,19 @@ private:
            !isWrittenThrough(Argv);
   }
 
-  // Functions checked to only read the array of VALUEs passed to them
-  static bool onlyReadsValueArray(const CallBase &CB) {
-    static const StringSet<> Names = {
-        "rb_scan_args",
-        "rb_scan_args_kw",
+  // Whether the argument is an array of VALUEs that the function was checked
+  // to only read: argv of rb_scan_args and rb_scan_args_kw (unlike the
+  // pointers after the format, which they write to)
+  static bool onlyReadsValueArray(const CallBase &CB, unsigned ArgNo) {
+    static const StringMap<unsigned> ArgvIndex = {
+        {"rb_scan_args", 1},
+        {"rb_scan_args_kw", 2},
     };
     const Function *Callee = CB.getCalledFunction();
-    return Callee && Names.contains(Callee->getName());
+    if (!Callee)
+      return false;
+    auto It = ArgvIndex.find(Callee->getName());
+    return It != ArgvIndex.end() && It->second == ArgNo;
   }
 
   // Whether something may write through Ptr (or what is derived from it).
@@ -939,7 +945,7 @@ private:
           if (CB->isArgOperand(&U)) {
             unsigned ArgNo = CB->getArgOperandNo(&U);
             if ((CB->onlyReadsMemory(ArgNo) && CB->doesNotCapture(ArgNo)) ||
-                onlyReadsValueArray(*CB))
+                onlyReadsValueArray(*CB, ArgNo))
               continue;
           }
         }
