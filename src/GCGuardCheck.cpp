@@ -662,13 +662,15 @@ SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
   return Result;
 }
 
-// The results of scanSlots, for each value and the instruction its aliases
-// were collected for (which decides the aliases)
+// The results of scanSlots, for each value A among the aliases of V
+// collected for Base (V and Base decide the aliases: a value may be an alias
+// of two arguments of a call, with different aliases)
 class SlotScanCache {
 public:
-  bool isInSlotAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
+  bool isInSlotAt(Value *A, const Value *V,
+                  const SmallPtrSet<Value *, 8> &Aliases,
                   const Instruction &Base, const Instruction *C) {
-    auto Key = std::make_pair(static_cast<const Value *>(A), &Base);
+    auto Key = std::make_tuple(static_cast<const Value *>(A), V, &Base);
     auto It = Cache.find(Key);
     if (It == Cache.end())
       It = Cache.try_emplace(Key, scanSlots(A, Aliases)).first;
@@ -677,23 +679,26 @@ public:
   }
 
 private:
-  DenseMap<std::pair<const Value *, const Instruction *>, SlotScan> Cache;
+  DenseMap<std::tuple<const Value *, const Value *, const Instruction *>,
+           SlotScan>
+      Cache;
 };
 
 // Whether v is in a stack slot at C. A phi is when all of its incoming values
 // are (whichever path it comes from, that path's value is in the slot), except
 // for constants, which are not objects in the heap.
-bool isResidentAt(Value *A, const SmallPtrSet<Value *, 8> &Aliases,
+bool isResidentAt(Value *A, const Value *V,
+                  const SmallPtrSet<Value *, 8> &Aliases,
                   const Instruction &Base, Instruction *C,
                   SlotScanCache &Slots, unsigned Depth = 0) {
-  if (Slots.isInSlotAt(A, Aliases, Base, C))
+  if (Slots.isInSlotAt(A, V, Aliases, Base, C))
     return true;
   auto *PN = dyn_cast<PHINode>(A);
   if (!PN || Depth >= 4)
     return false;
   return all_of(PN->incoming_values(), [&](Value *In) {
     return In == PN || isa<Constant>(In) ||
-           isResidentAt(In, Aliases, Base, C, Slots, Depth + 1);
+           isResidentAt(In, V, Aliases, Base, C, Slots, Depth + 1);
   });
 }
 
@@ -962,7 +967,7 @@ bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
   for (Value *A : Aliases) {
     if (hasUseReachableFrom(A, C, R, IncludeC))
       return true;
-    if (isResidentAt(A, Aliases, Base, C, CA.slotScans()))
+    if (isResidentAt(A, V, Aliases, Base, C, CA.slotScans()))
       return true;
     for (AllocaInst *Slot : collectSlots(A)) {
       if (mayBeOverwrittenBefore(Slot, A, Aliases, C, R))
