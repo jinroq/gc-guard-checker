@@ -130,6 +130,31 @@ done:
   ret i64 4
 }
 
+; A store through a new pointer f of the new string, of the pointer carried
+; from the previous iteration as the value. The store is not through the
+; carried pointer, so it is not an access to v of the previous iteration. Not
+; reported.
+define i64 @ok_carried_ptr_stored_as_value(i64 %n) {
+entry:
+  br label %loop
+
+loop:
+  %prevp = phi ptr [ null, %entry ], [ %f, %loop ]
+  %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]
+  %gc = call i64 @rb_ary_new()
+  %v = call i64 @rb_str_new_static(ptr @.str, i64 1)
+  %obj = inttoptr i64 %v to ptr
+  %flags = load i64, ptr %obj, align 8, !tbaa !0
+  %f = getelementptr inbounds i8, ptr %obj, i64 24
+  store ptr %prevp, ptr %f, align 8
+  %i.next = add i64 %i, 1
+  %done = icmp eq i64 %i.next, %n
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret i64 4
+}
+
 !0 = !{!1, !2, i64 0}
 !1 = !{!"RBasic", !2, i64 0, !2, i64 8}
 !2 = !{!"long", !3, i64 0}

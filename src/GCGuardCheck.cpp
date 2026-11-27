@@ -727,12 +727,20 @@ public:
                 const Reachability &R)
       : V(V), C(C), IsFollowed(std::move(IsFollowed)), R(R) {}
 
-  // Whether an operand of the access U may be derived from v at C
+  // Whether the pointer that the access U goes through (the pointer operand
+  // of a load or a store, or an argument of a call) may be derived from v at
+  // C. A pointer stored as the value is not accessed through.
   bool isAccessToValueAtC(Instruction *U) {
     if (U == C)
       return true;
-    return any_of(U->operands(),
-                  [&](Value *P) { return isFollowed(P) && isCarried(P, U); });
+    auto Carried = [&](Value *P) { return isFollowed(P) && isCarried(P, U); };
+    if (auto *LI = dyn_cast<LoadInst>(U))
+      return Carried(LI->getPointerOperand());
+    if (auto *SI = dyn_cast<StoreInst>(U))
+      return Carried(SI->getPointerOperand());
+    if (auto *CB = dyn_cast<CallBase>(U))
+      return any_of(CB->args(), [&](Use &Arg) { return Carried(Arg.get()); });
+    return false;
   }
 
   // Whether X at To may be (derived from) v at C
