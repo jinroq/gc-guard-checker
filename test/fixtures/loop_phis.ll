@@ -178,6 +178,81 @@ exit:
   ret void
 }
 
+; v = rb_io_taint_check(x) is made from x, computed before v. The call
+; receives a pointer into v of the previous iteration, but x there is already
+; computed again, a new value, so its use after the call (by v) does not keep
+; the previous v. Reported.
+declare i64 @rb_io_taint_check(i64)
+
+define void @bad_origin_computed_again_before_call(i64 %n) {
+entry:
+  br label %loop
+
+loop:
+  %p = phi ptr [ @.str, %entry ], [ %ptr.field, %loop ]
+  %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]
+  %x = call i64 @rb_str_new_static(ptr @.str, i64 1)
+  call void @take(ptr %p)
+  %v = call i64 @rb_io_taint_check(i64 %x)
+  %obj = inttoptr i64 %v to ptr
+  %ptr.field = getelementptr i8, ptr %obj, i64 24
+  %i.next = add i64 %i, 1
+  %done = icmp slt i64 %i.next, %n
+  br i1 %done, label %loop, label %exit
+
+exit:
+  ret void
+}
+
+; As bad_origin_computed_again_before_call, with a value made from x as is
+; after the call and used. It is made from the new x, so it does not keep the
+; previous v either. Reported.
+define void @bad_value_made_from_origin_after_call(i64 %n) {
+entry:
+  br label %loop
+
+loop:
+  %p = phi ptr [ @.str, %entry ], [ %ptr.field, %loop ]
+  %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]
+  %x = call i64 @rb_str_new_static(ptr @.str, i64 1)
+  call void @take(ptr %p)
+  %v = call i64 @rb_io_taint_check(i64 %x)
+  %obj = inttoptr i64 %v to ptr
+  %ptr.field = getelementptr i8, ptr %obj, i64 24
+  %k = call i64 @rb_io_taint_check(i64 %x)
+  %i.k = add i64 %i, %k
+  %i.next = add i64 %i.k, 1
+  %done = icmp slt i64 %i.next, %n
+  br i1 %done, label %loop, label %exit
+
+exit:
+  ret void
+}
+
+; The same, but the call is after v, where x is still v, and its use after the
+; call keeps v for the read through the pointer. Not reported (boundary).
+define void @ok_origin_not_computed_again_before_call(i64 %n) {
+entry:
+  br label %loop
+
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]
+  %x = call i64 @rb_str_new_static(ptr @.str, i64 1)
+  %v = call i64 @rb_io_taint_check(i64 %x)
+  %obj = inttoptr i64 %v to ptr
+  %ptr.field = getelementptr i8, ptr %obj, i64 24
+  call void @take(ptr %ptr.field)
+  %c = load i8, ptr %ptr.field
+  %c.ext = zext i8 %c to i64
+  %i.x = add i64 %i, %x
+  %i.next = add i64 %i.x, %c.ext
+  %done = icmp slt i64 %i.next, %n
+  br i1 %done, label %loop, label %exit
+
+exit:
+  ret void
+}
+
 !0 = !{!1, !2, i64 0}
 !1 = !{!"RBasic", !2, i64 0, !2, i64 8}
 !2 = !{!"long", !3, i64 0}

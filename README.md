@@ -40,7 +40,9 @@ is not an object in the heap.
 - `v`, or a value with the same bits (casts, phis and selects merging `v`, a
   value compared equal to `v` in the dominated region), is used after C. In a
   loop, a use in the next iteration after `v` is defined again is of a new
-  value, so it does not count,
+  value, so it does not count. Likewise a value `v` is made from
+  (`x` in `v = rb_io_taint_check(x)`) computed again between `v` and C is a
+  new value, and does not count,
 - on every path from the definition of `v` to C, `v` is in a stack slot that
   stays in memory, as its address has escaped (as `RB_GC_GUARD(v)` does) or it
   is accessed with volatile loads or stores (as by `StringValue(v)` with

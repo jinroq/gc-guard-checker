@@ -412,6 +412,39 @@ SmallPtrSet<Value *, 8> collectValueAliases(Value *V,
   return Aliases;
 }
 
+// The aliases of v computed before v: the values v is made from as is
+// (v = rb_io_taint_check(x)), and those made from them as is without v. They
+// are v at C only if C is reached from v without computing them again: in a
+// loop, x computed again before C is a new value, not the v of the previous
+// iteration.
+SmallPtrSet<Value *, 8> collectOrigins(Value *V, const DominatorTree &DT) {
+  SmallPtrSet<Value *, 8> Origins;
+  auto *Def = dyn_cast<Instruction>(V);
+  if (!Def)
+    return Origins;
+  SmallVector<Value *, 8> Worklist;
+  for (auto *CB = dyn_cast<CallBase>(V); CB && returnsFirstArgument(*CB);
+       CB = dyn_cast<CallBase>(CB->getArgOperand(0)))
+    Worklist.push_back(CB->getArgOperand(0));
+  while (!Worklist.empty()) {
+    Value *A = Worklist.pop_back_val();
+    auto *I = dyn_cast<Instruction>(A);
+    if (!I || I == Def || isa<PHINode>(I) || DT.dominates(Def, I) ||
+        !Origins.insert(A).second)
+      continue;
+    for (User *U : A->users())
+      if (isa<IntToPtrInst, PtrToIntInst, BitCastInst, AddrSpaceCastInst>(U))
+        Worklist.push_back(U);
+      else if (auto *GEP = dyn_cast<GetElementPtrInst>(U);
+               GEP && GEP->hasAllZeroIndices())
+        Worklist.push_back(GEP);
+      else if (auto *CB = dyn_cast<CallBase>(U);
+               CB && returnsFirstArgument(*CB) && CB->getArgOperand(0) == A)
+        Worklist.push_back(CB);
+  }
+  return Origins;
+}
+
 // Collects the candidate stack slots (allocas) that may hold v. A variable
 // whose address is taken by RB_GC_GUARD(v) lives in an alloca, so v is stored
 // to it or loaded from it. For a phi, only the slots common to all incoming
@@ -1250,9 +1283,20 @@ bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
               const Instruction &Base, const Reachability &R,
               CallerAnalysis &CA, bool IncludeC) {
   auto Aliases = collectValueAliases(V, &DT, &Base);
+  // The aliases computed before v, and computed again before C: new values
+  SmallPtrSet<Value *, 8> Stale;
+  for (Value *A : collectOrigins(V, DT))
+    if (!R.reachesAfterWithSameValue(A, cast<Instruction>(V), C))
+      Stale.insert(A);
   CarriedValues Carried(
-      V, C, [&](const Value *X) { return Aliases.contains(X); }, R);
+      V, C,
+      [&](const Value *X) {
+        return Aliases.contains(X) && !Stale.contains(X);
+      },
+      R);
   for (Value *A : Aliases) {
+    if (Stale.contains(A))
+      continue;
     if (hasUseOfValueAtC(A, C, Carried, IncludeC))
       return true;
     if (isResidentAt(A, V, Aliases, Base, C, CA.slotScans()))
