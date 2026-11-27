@@ -144,6 +144,10 @@ class TestGCGuardCheck < Test::Unit::TestCase
                  reported_functions("loaded_from_escaped_slot.c"))
   end
 
+  def test_value_in_slot_with_volatile_stores
+    assert_equal(["bad_volatile_slot_overwritten"], reported_functions("string_value.c"))
+  end
+
   def test_many_copies_of_slot
     assert_equal([], reported_functions("many_slot_copies.c"))
   end

@@ -527,6 +527,22 @@ bool isEscaped(AllocaInst *Slot) {
   return false;
 }
 
+// Whether the slot stays in memory, rather than being promoted to registers:
+// its address escapes, or it is accessed with volatile loads or stores, as by
+// rb_string_value(volatile VALUE *) inlined in string.c. What is stored there
+// then stays on the stack until the slot is overwritten.
+bool isInMemory(AllocaInst *Slot) {
+  if (isEscaped(Slot))
+    return true;
+  return any_of(Slot->users(), [](User *U) {
+    if (auto *LI = dyn_cast<LoadInst>(U))
+      return LI->isVolatile();
+    if (auto *SI = dyn_cast<StoreInst>(U))
+      return SI->isVolatile();
+    return false;
+  });
+}
+
 // Whether v is in one of the stack slots holding it whenever C is executed
 // after v is defined. For a slot whose address has escaped, the compiler must
 // assume that later calls may read it, so it cannot remove or delay stores to
@@ -568,7 +584,7 @@ SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
     return unsigned(Slots.size() - 1);
   };
   auto HoldsAcrossCalls = [](StoreInst *SI, AllocaInst *Slot) {
-    return Slot && (SI->isVolatile() || isEscaped(Slot));
+    return Slot && (SI->isVolatile() || isInMemory(Slot));
   };
   constexpr uint64_t SlotBits = (uint64_t(1) << MaxSlots) - 1;
   // What an instruction does to a bit: sets it, clears it, or copies another
@@ -593,7 +609,7 @@ SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
   uint64_t Initial = 0;
   if (auto *LI = dyn_cast<LoadInst>(A))
     if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand());
-        Slot && isEscaped(Slot))
+        Slot && isInMemory(Slot))
       if (auto Index = IndexOf(Slot))
         Initial = uint64_t(1) << *Index;
   // Copies from the slots found so far, which may find more slots

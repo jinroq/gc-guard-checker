@@ -37,9 +37,10 @@ reported when `tmp` is dead, since `rb_str_new` allocates before copying.
   value compared equal to `v` in the dominated region), is used after C. In a
   loop, a use in the next iteration after `v` is defined again is of a new
   value, so it does not count,
-- on every path from the definition of `v` to C, `v` is in a stack slot whose
-  address has escaped (as `RB_GC_GUARD(v)` does): it is stored or copied
-  there, and the slot is neither overwritten nor ends its lifetime before C.
+- on every path from the definition of `v` to C, `v` is in a stack slot that
+  stays in memory, as its address has escaped (as `RB_GC_GUARD(v)` does) or it
+  is accessed with volatile loads or stores (as by `StringValue(v)` with
+  `rb_string_value` inlined): it is stored or copied there, and the slot is neither overwritten nor ends its lifetime before C.
   Once the address escapes, the compiler cannot remove or delay stores to the
   slot, so `RB_GC_GUARD` anywhere in the function protects `v` as long as `v`
   is not reassigned and the slot lives. `v` may be in different slots on
