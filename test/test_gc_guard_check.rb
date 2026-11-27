@@ -145,7 +145,8 @@ class TestGCGuardCheck < Test::Unit::TestCase
   end
 
   def test_slots_and_pointers_on_the_same_path
-    assert_equal(["bad_interior_pointer_in_escaped_slot", "bad_pointer_kept_after_slot_overwritten"],
+    assert_equal(["bad_interior_pointer_in_escaped_slot", "bad_pointer_kept_after_slot_overwritten",
+                  "bad_slot_overwritten_by_call"],
                  reported_functions("path_sensitive_slots.c"))
   end
 

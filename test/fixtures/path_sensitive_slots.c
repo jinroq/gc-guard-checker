@@ -65,3 +65,30 @@ bad_interior_pointer_in_escaped_slot(void)
     rb_ary_new();
     return p[0];
 }
+
+/* The address of the slot of s is passed to a call, which may store another
+ * value there (as rb_string_value(&v) stores the converted value). s may not
+ * be in the slot at the GC call after that. Reported. */
+void may_overwrite(VALUE *slot);
+
+long
+bad_slot_overwritten_by_call(void)
+{
+    VALUE s = rb_str_new_cstr("x");
+    const char *p = RSTRING_PTR(s);
+    may_overwrite(&s);
+    rb_ary_new();
+    return p[0];
+}
+
+/* RB_GC_GUARD passes the address of the slot to an asm, which does not store
+ * there. Not reported (boundary). */
+long
+ok_slot_address_to_guard(void)
+{
+    VALUE s = rb_str_new_cstr("x");
+    const char *p = RSTRING_PTR(s);
+    RB_GC_GUARD(s);
+    rb_ary_new();
+    return p[0];
+}

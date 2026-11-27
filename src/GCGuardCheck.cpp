@@ -595,6 +595,24 @@ bool isInMemory(AllocaInst *Slot) {
   });
 }
 
+// The calls that may store to the slot: they receive its address, or a
+// pointer to it, as an argument they do not only read (rb_string_value(&v)
+// stores the converted value). The asm of RB_GC_GUARD only takes it.
+SmallVector<CallBase *, 4> callsWritingTo(AllocaInst *Slot) {
+  SmallVector<CallBase *, 4> Calls;
+  for (Value *H : collectHolders(Slot))
+    for (Use &U : H->uses()) {
+      auto *CB = dyn_cast<CallBase>(U.getUser());
+      if (!CB || !CB->isArgOperand(&U) || CB->isInlineAsm() ||
+          CB->isLifetimeStartOrEnd() || isa<DbgInfoIntrinsic>(CB))
+        continue;
+      if (CB->onlyReadsMemory(CB->getArgOperandNo(&U)))
+        continue;
+      Calls.push_back(CB);
+    }
+  return Calls;
+}
+
 // Whether v is in one of the stack slots holding it whenever C is executed
 // after v is defined. For a slot whose address has escaped, the compiler must
 // assume that later calls may read it, so it cannot remove or delay stores to
@@ -648,6 +666,7 @@ SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
     unsigned From = 0;
   };
   DenseMap<const Instruction *, Effect> Effects;
+  DenseMap<const Instruction *, uint64_t> CallTakes;
   for (User *U : A->users()) {
     auto *SI = dyn_cast<StoreInst>(U);
     if (!SI || SI->getValueOperand() != A)
@@ -705,6 +724,8 @@ SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
       if (auto *II = dyn_cast<IntrinsicInst>(U);
           II && II->getIntrinsicID() == Intrinsic::lifetime_end)
         Effects[II] = {Kind::Take, I};
+    for (CallBase *CB : callsWritingTo(Slots[I]))
+      CallTakes[CB] |= uint64_t(1) << I;
   }
 
   auto *Def = dyn_cast<Instruction>(A);
@@ -717,9 +738,13 @@ SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
       const Instruction *I = &*It;
       if (I == Def)
         return;
-      if (isa<CallBase>(I))
+      if (isa<CallBase>(I)) {
         Result[I] |= (State & SlotBits) ? CallReached
                                         : CallReached | CallReachedOutOfSlots;
+        // A call storing to a slot does so during the call
+        if (auto T = CallTakes.find(I); T != CallTakes.end())
+          State &= ~T->second;
+      }
       if (auto E = Effects.find(I); E != Effects.end()) {
         const Effect &Eff = E->second;
         uint64_t Bit = uint64_t(1) << Eff.Bit;
@@ -1404,9 +1429,12 @@ public:
       if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand()))
         if (auto It = SlotIndex.find(Slot); It != SlotIndex.end())
           InitialSlots = uint64_t(1) << It->second;
-    for (AllocaInst *Slot : Slots)
+    for (AllocaInst *Slot : Slots) {
       for (StoreInst *SI : storesTo(Slot))
         StoreSlot[SI] = SlotIndex[Slot];
+      for (CallBase *CB : callsWritingTo(Slot))
+        CallTakes[CB] |= uint64_t(1) << SlotIndex[Slot];
+    }
   }
 
   Result confirm(Instruction *C, Instruction *&Use) {
@@ -1501,6 +1529,8 @@ private:
           return true;
         }
       }
+      if (auto T = CallTakes.find(I); T != CallTakes.end())
+        S.Slots &= ~T->second;
       if (auto *SI = dyn_cast<StoreInst>(I)) {
         if (auto E = StoreSlot.find(SI); E != StoreSlot.end()) {
           uint64_t SlotBit = uint64_t(1) << E->second;
@@ -1546,6 +1576,7 @@ private:
   SmallVector<AllocaInst *, 4> Slots;
   DenseMap<const AllocaInst *, unsigned> SlotIndex;
   DenseMap<const StoreInst *, unsigned> StoreSlot;
+  DenseMap<const Instruction *, uint64_t> CallTakes;
   uint64_t InitialSlots = 0;
   bool Overflow = false;
   unsigned Steps = 0;
