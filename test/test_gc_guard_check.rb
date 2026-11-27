@@ -150,6 +150,11 @@ class TestGCGuardCheck < Test::Unit::TestCase
                  reported_functions("path_sensitive_slots.c"))
   end
 
+  def test_path_confirmation_edges
+    assert_equal(["bad_kept_over_tracking_limit", "bad_slot_lifetime_ended", "bad_value_defined_by_phi"],
+                 reported_functions("path_confirmation_edges.c"))
+  end
+
   def test_value_known_to_be_constant_at_gc_call
     assert_equal(["bad_value_not_constant_at_gc"], reported_functions("value_constant_at_gc.c"))
   end
