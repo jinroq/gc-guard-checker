@@ -842,7 +842,8 @@ SlotScan scanSlots(Value *A, const SmallPtrSet<Value *, 8> &Aliases) {
       if (isa<CallBase>(I)) {
         Result[I] |= (State & SlotBits) ? CallReached
                                         : CallReached | CallReachedOutOfSlots;
-        // A call storing to a slot does so during the call
+        // A call storing to a slot is taken to do so when it returns, as
+        // rb_string_value(&v) stores after converting, which may trigger GC
         if (auto T = CallTakes.find(I); T != CallTakes.end())
           State &= ~T->second;
       }
@@ -1443,7 +1444,10 @@ void printLocation(raw_ostream &OS, const Instruction &I) {
     OS << "<unknown>";
 }
 
-void report(Function &F, Value *V, CallBase &C, Instruction &Use) {
+// Unconfirmed when the confirmation on one path (PathConfirmation) gave up:
+// such a report is more likely a false one.
+void report(Function &F, Value *V, CallBase &C, Instruction &Use,
+            bool Unconfirmed) {
   raw_ostream &OS = outs();
   OS << "gc-guard-check: " << F.getName() << ": pointer derived from ";
   V->printAsOperand(OS, false);
@@ -1456,8 +1460,10 @@ void report(Function &F, Value *V, CallBase &C, Instruction &Use) {
     OS << "indirect call";
   OS << " at ";
   printLocation(OS, C);
-  OS << " without keeping it alive [origin=" << originName(originOf(V))
-     << "]\n";
+  OS << " without keeping it alive ";
+  if (Unconfirmed)
+    OS << "[unconfirmed] ";
+  OS << "[origin=" << originName(originOf(V)) << "]\n";
 }
 
 // Confirms a report on one path. The checks above look at the stack slots
@@ -1673,6 +1679,7 @@ private:
           return true;
         }
       }
+      // After C is checked: a call storing to a slot does so when it returns
       if (auto T = CallTakes.find(I); T != CallTakes.end())
         S.Slots &= ~T->second;
       if (auto *SI = dyn_cast<StoreInst>(I)) {
@@ -1793,8 +1800,8 @@ struct GCGuardCheckPass : PassInfoMixin<GCGuardCheckPass> {
         auto Res = PC->confirm(C, PathUse);
         if (Res == PathConfirmation::Result::NotFound)
           continue;
-        report(F, V, *C,
-               Res == PathConfirmation::Result::Confirmed ? *PathUse : **Use);
+        bool Confirmed = Res == PathConfirmation::Result::Confirmed;
+        report(F, V, *C, Confirmed ? *PathUse : **Use, !Confirmed);
         Reported.insert(V);
         break;
       }

@@ -164,6 +164,13 @@ class TestGCGuardCheck < Test::Unit::TestCase
     assert_equal([], reported_functions("value_loaded_from_slot_to_call.ll"))
   end
 
+  def test_report_not_confirmed_on_one_path_is_marked
+    reports = analyze("path_confirmation_edges.c").lines
+    unconfirmed = reports.select { |l| l.include?("[unconfirmed]") }.map { |l| l[REPORT_RE, 1] }
+    assert_equal(["bad_kept_over_tracking_limit"], unconfirmed.uniq)
+    assert(reports.all? { |l| l.end_with?("]\n") && l =~ /\[origin=[a-z]+\]$/ })
+  end
+
   def test_path_confirmation_edges
     assert_equal(["bad_kept_over_tracking_limit", "bad_slot_lifetime_ended", "bad_value_defined_by_phi"],
                  reported_functions("path_confirmation_edges.c"))

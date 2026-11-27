@@ -182,6 +182,7 @@ call to rb_yield`, ...) finds them quickly. The common false reports are:
   that does not allocate, debug dumps with `ruby_snprintf`, ...).
 - `v` is out of its slots on a path where the pointer used after the call is
   not from `v`, when the confirmation on one path gives up (see Limitations).
+  Such a report is marked `[unconfirmed]`.
 
 To check a report, build CRuby with AddressSanitizer
 (`cflags="-fsanitize=address -fno-omit-frame-pointer" LDFLAGS=-fsanitize=address`)
@@ -234,10 +235,16 @@ False reports:
   block, which is the call itself. This does not happen in C.
 - Beyond 32 stack slots or 32 copies between them for a value, the rest are
   not tracked, and `v` there does not count.
+- A call receiving the address of a slot holding `v` is taken to store
+  another value there when it returns, as `rb_string_value(&v)` does after
+  converting, unless it only reads through its arguments (`readonly`, or a
+  function of CRuby taking `const VALUE *argv`). A function storing there
+  before triggering GC is not seen.
 - The confirmation on one path gives up, keeping the report, beyond 64 values
   that are `v` or derived from it, 32 slots, 8 values `v` is made from as is
   (`v = rb_io_taint_check(x)`, counting `v`), 200000 blocks scanned for a call,
-  or 1000000 for all the calls of a `v`.
+  or 1000000 for all the calls of a `v` (so the calls checked first may use
+  it up for the others).
 
 Cost:
 
