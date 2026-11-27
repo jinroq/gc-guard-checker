@@ -799,18 +799,18 @@ private:
   unsigned MinAssumedDepth = UINT_MAX;
 };
 
-// Whether there is an actual use of X reachable from C. A use at C itself
-// counts when IncludeC is set: the callee receives v and is expected to keep
-// it, as rb_str_resize(str, ...) does. A use reached only through the
-// definition of X again (in the next iteration of a loop) is of a new value,
-// so it does not count.
-bool hasUseReachableFrom(Value *X, Instruction *C, const Reachability &R,
-                         bool IncludeC) {
-  for (User *U : X->users()) {
+// Whether there is an actual use of H, a slot or a pointer to it, reachable
+// from C. Unlike for values with the same bits as v, it does not matter
+// whether H is computed again (in a loop), as it is the address of the same
+// slot. A use at C itself counts when IncludeC is set, as for
+// hasUseOfValueAtC.
+bool hasHolderUseAfter(Value *H, Instruction *C, const Reachability &R,
+                       bool IncludeC) {
+  for (User *U : H->users()) {
     auto *I = dyn_cast<Instruction>(U);
     if (!I || I->isLifetimeStartOrEnd())
       continue;
-    if ((IncludeC && I == C) || R.reachesAfterWithSameValue(X, C, I))
+    if ((IncludeC && I == C) || R.reachesAfter(C, I))
       return true;
   }
   return false;
@@ -819,8 +819,8 @@ bool hasUseReachableFrom(Value *X, Instruction *C, const Reachability &R,
 // Whether X, a value with the same bits as v, is used after C while it may
 // still be v at C (a use in the next iteration may be of v computed again, or
 // of v carried by a phi). A use by a phi happens at the end of the incoming
-// block. A use at C itself counts when IncludeC is set, as for
-// hasUseReachableFrom.
+// block. A use at C itself counts when IncludeC is set: the callee receives v
+// and is expected to keep it, as rb_str_resize(str, ...) does.
 bool hasUseOfValueAtC(Value *X, Instruction *C, CarriedValues &Carried,
                       bool IncludeC) {
   for (Use &U : X->uses()) {
@@ -1099,7 +1099,7 @@ bool isLiveAt(Value *V, Instruction *C, const DominatorTree &DT,
       if (mayBeOverwrittenBefore(Slot, A, Aliases, C, R))
         continue;
       for (Value *H : collectHolders(Slot))
-        if (hasUseReachableFrom(H, C, R, IncludeC))
+        if (hasHolderUseAfter(H, C, R, IncludeC))
           return true;
     }
   }
