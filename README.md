@@ -147,6 +147,42 @@ flags (the SIMD implementations of BLAKE3) cannot be compiled by the script;
 they do not use the Ruby API. If the checker itself fails on a file, the
 reports are incomplete, so the script lists the file and exits with an error.
 
+## Triaging reports
+
+Most reports are not bugs, so it pays to start from the shapes that turned
+out to be bugs in CRuby:
+
+- A pointer into a new string, or a string converted with `#to_str`, is
+  passed to a call that allocates before copying from it: `rb_str_buf_cat`
+  resizing the destination, `rb_str_new`, `rb_str_tmp_new`, ...
+  (`pack("w")`, `String#scrub` with a replacement responding to `#to_str`,
+  `IO#set_encoding`, `rb_home_dir_of`, `append_fspath`).
+- A pointer into the hidden array of `NEW_MEMO_FOR` is used after the block
+  or `#<=>` is called, once `rb_block_call` has returned
+  (`Enumerable#minmax`).
+
+Grepping `reports.txt` for these calls (`after call to rb_str_cat`, `after
+call to rb_yield`, ...) finds them quickly. The common false reports are:
+
+- `v` is reachable from an object or a struct: the string of a
+  `StringScanner`, the buffer of a zlib stream, the source of a `Regexp`, the
+  arguments kept in an `Enumerator`, ...
+- The call does not trigger GC in practice, but is not known to the checker
+  (`rb_st_lookup` on a table with ID keys, a callback of `rb_id_table_foreach`
+  that does not allocate, debug dumps with `ruby_snprintf`, ...).
+- `v` is out of its slots on a path where the pointer used after the call is
+  not from `v` (see Limitations).
+
+To check a report, build CRuby with AddressSanitizer
+(`cflags="-fsanitize=address -fno-omit-frame-pointer" LDFLAGS=-fsanitize=address`)
+and run the code under `GC.stress = true`. When it does not crash, the value
+is often kept alive only by stale copies below the stack pointer, left by
+earlier calls. With gdb, break at the call that may trigger GC and check that
+no register and no slot between the stack pointer and the stack top holds
+`v`, then break at `gc_mark_maybe_internal` with `$rsi == v` while the call
+runs, to see where it is marked from. Calling functions from gdb overwrites
+the stack below the stack pointer, which may make the bug show up.
+
 ## Limitations
 
 Reports are candidates to be checked by reading the code, not confirmed bugs.
