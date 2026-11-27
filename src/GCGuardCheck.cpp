@@ -1369,10 +1369,10 @@ public:
   PathConfirmation(Value *V, const SmallPtrSet<Value *, 8> &Aliases,
                    const SmallSetVector<Value *, 16> &Derived,
                    const SmallVector<Instruction *, 8> &Accesses)
-      : V(V), Def(dyn_cast<Instruction>(V)),
+      : Def(dyn_cast<Instruction>(V)),
         AccessSet(Accesses.begin(), Accesses.end()) {
     auto Track = [&](Value *X) {
-      if (isa<Instruction>(X) || X == V)
+      if (isa<Instruction, Argument>(X))
         if (!TrackedIndex.count(X) && Tracked.size() < MaxTracked) {
           TrackedIndex[X] = Tracked.size();
           Tracked.push_back(X);
@@ -1406,10 +1406,20 @@ public:
             LI && LI->getPointerOperand() == Slot)
           TrackSameBits(LI);
     };
-    if (auto *LI = dyn_cast<LoadInst>(V))
-      if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand());
-          Slot && isInMemory(Slot))
-        AddSlot(Slot);
+    // v and the values it is made from as is (v = rb_io_taint_check(x)),
+    // which are defined before v and are v when it is defined
+    for (Value *X = V;;) {
+      TrackSameBits(X);
+      PreAliases.push_back(X);
+      if (auto *LI = dyn_cast<LoadInst>(X))
+        if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand());
+            Slot && isInMemory(Slot))
+          AddSlot(Slot);
+      auto *CB = dyn_cast<CallBase>(X);
+      if (!CB || !returnsFirstArgument(*CB) || PreAliases.size() >= 8)
+        break;
+      X = CB->getArgOperand(0);
+    }
     for (unsigned I = 0; I < Tracked.size() && !Overflow; ++I) {
       for (User *U : Tracked[I]->users()) {
         auto *SI = dyn_cast<StoreInst>(U);
@@ -1425,10 +1435,13 @@ public:
       return;
     if (Tracked.size() >= MaxTracked)
       Overflow = true;
-    if (auto *LI = dyn_cast<LoadInst>(V))
-      if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand()))
-        if (auto It = SlotIndex.find(Slot); It != SlotIndex.end())
-          InitialSlots = uint64_t(1) << It->second;
+    for (Value *X : PreAliases) {
+      InitialCarried |= bit(X);
+      if (auto *LI = dyn_cast<LoadInst>(X))
+        if (auto *Slot = dyn_cast<AllocaInst>(LI->getPointerOperand()))
+          if (auto It = SlotIndex.find(Slot); It != SlotIndex.end())
+            InitialSlots |= uint64_t(1) << It->second;
+    }
     for (AllocaInst *Slot : Slots) {
       for (StoreInst *SI : storesTo(Slot))
         StoreSlot[SI] = SlotIndex[Slot];
@@ -1447,7 +1460,7 @@ public:
     const BasicBlock *StartBB =
         Def ? Def->getParent()
             : &C->getFunction()->getEntryBlock();
-    State Start{InitialSlots, bit(V), false};
+    State Start{InitialSlots, InitialCarried, false};
     BasicBlock::const_iterator It =
         Def ? std::next(Def->getIterator()) : StartBB->begin();
     if (Def && isa<PHINode>(Def))
@@ -1568,7 +1581,6 @@ private:
     return false;
   }
 
-  Value *V;
   Instruction *Def;
   Instruction *C = nullptr;
   SmallPtrSet<const Instruction *, 8> AccessSet;
@@ -1579,7 +1591,8 @@ private:
   DenseMap<const AllocaInst *, unsigned> SlotIndex;
   DenseMap<const StoreInst *, unsigned> StoreSlot;
   DenseMap<const Instruction *, uint64_t> CallTakes;
-  uint64_t InitialSlots = 0;
+  uint64_t InitialSlots = 0, InitialCarried = 0;
+  SmallVector<Value *, 8> PreAliases;
   bool Overflow = false;
   unsigned Steps = 0, TotalSteps = 0;
   SmallVector<std::pair<const BasicBlock *, State>, 32> Worklist;

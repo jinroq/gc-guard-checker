@@ -92,3 +92,33 @@ ok_slot_address_to_guard(void)
     rb_ary_new();
     return p[0];
 }
+
+/* v = rb_io_taint_check(from) returns from as is, so from, loaded from its
+ * slot before v is defined, is v too, and the slot holds it. As in
+ * ok_slot_overwritten_on_path_without_pointer, the slot is overwritten only
+ * on paths where the call receives "". Not reported. */
+VALUE rb_io_taint_check(VALUE io);
+
+VALUE
+ok_alias_defined_before_value(VALUE ary, VALUE res)
+{
+    VALUE from;
+    long n = RARRAY_LEN(ary);
+    for (long i = 0; i < n; i++) {
+        const char *ptr;
+        long len;
+        from = RARRAY_AREF(ary, i);
+        if (NIL_P(from)) {
+            ptr = "";
+            len = 0;
+        }
+        else {
+            StringValue(from);
+            VALUE v = rb_io_taint_check(from);
+            ptr = RSTRING_PTR(v);
+            len = RSTRING_LEN(v);
+        }
+        rb_str_cat(res, ptr, len);
+    }
+    return res;
+}
